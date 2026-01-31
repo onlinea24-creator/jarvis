@@ -1,400 +1,1018 @@
-"use strict";
-
-const { app, BrowserWindow, ipcMain, Tray, Menu, Notification, dialog, globalShortcut, screen, safeStorage } = require("electron");
-// --- single instance lock ---
-const gotLock = app.requestSingleInstanceLock();
-if (!gotLock) {
-  app.quit();
-} else {
-  app.on('second-instance', () => {
-    try {
-      const w = BrowserWindow.getAllWindows()[0];
-      if (w) {
-        if (w.isMinimized()) w.restore();
-        w.show();
-        w.focus();
-      }
-    } catch (e) {}
-  });
-}
-const path = require("path");
 const fs = require("fs");
+const path = require("path");
 const crypto = require("crypto");
+const dns = require("dns").promises;
+const net = require("net");
+const OpenAI = require("openai");
+const memory = require("./memory_store");
 
-const { runTask } = require("./jarvis_runner");
+const RUNNER_VERSION = "JARVIS_RUNNER_AUDIT_SSOT_V1_2026-01-30";
 
-let win = null;
-let tray = null;
-let isQuitting = false;
+// ---------- helpers ----------
+function safeMkdir(dir) { try { fs.mkdirSync(dir, { recursive: true }); } catch (_) {} }
 
-// -------------------- Paths (always computed at runtime) --------------------
-function userDataRoot() {
-  try { return app.getPath("userData"); } catch (_) { return process.env.APPDATA || process.cwd(); }
+function sha256Text(txt) {
+  return crypto.createHash("sha256").update(String(txt || ""), "utf8").digest("hex");
 }
-function proofsRoot() { return path.join(userDataRoot(), "proofs"); }
-function auditDir() { return path.join(proofsRoot(), "audit"); }
-function auditFilePath() { return path.join(auditDir(), "audit.jsonl"); }
-function auditStatePath() { return path.join(auditDir(), "audit_state.json"); }
-function cfgPath() { return path.join(userDataRoot(), "jarvis_cfg.json"); }
-function runnerPermsPath() { return path.join(userDataRoot(), "jarvis_permissions.json"); }
 
+function clip(s, max) {
+  const t = String(s || "");
+  return t.length <= max ? t : t.slice(0, max) + "…";
+}
 
-// -------------------- API KEY (secure store, OS-encrypted) --------------------
-function apiKeyStorePath() { return path.join(userDataRoot(), "jarvis_api_key.enc"); }
+function normOneLine(s) { return String(s || "").replace(/\s+/g, " ").trim(); }
 
-function canEncryptApiKey() {
+function writeFileProof(filePath, content) {
+  const data = String(content || "");
+  safeMkdir(path.dirname(filePath));
+  fs.writeFileSync(filePath, data, "utf8");
+  return { path: filePath, bytes: Buffer.byteLength(data, "utf8"), sha256: sha256Text(data) };
+}
+
+function compactHistory(history, maxTurns = 10, maxChars = 360) {
+  const arr = Array.isArray(history) ? history : [];
+  const clean = arr
+    .filter((m) => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
+    .map((m) => ({ role: m.role, content: clip(normOneLine(m.content), maxChars) }));
+  return clean.slice(-maxTurns);
+}
+
+function wantsTauriAction(taskText) {
+  const t = String(taskText || "").toLowerCase();
+  return t.includes("tauri") && (t.includes("prepare") || t.includes("prepara") || t.includes("setup") || t.includes("scaffold") || t.includes("create"));
+}
+
+function makeRunId() {
+  const iso = new Date().toISOString().replace(/:/g, "-").replace(/\./g, "-");
+  return `RUN_${iso}`;
+}
+
+function appDataRoot() {
+  const a = process.env.APPDATA ? String(process.env.APPDATA) : "";
+  if (a) return path.join(a, "jarvis_electron_v1");
+  return path.join(process.cwd(), "jarvis_electron_v1");
+}
+
+function nowISO() { return new Date().toISOString(); }
+
+// ---------- Permissions (Phase 0 baseline) ----------
+function loadPermissions(opts) {
+  const defaults = {
+    web_search: true,
+    web_fetch: true,
+    web_read: true,
+    tauri_plan: true,
+    cmd_exec: false,
+    download: false,
+    ssot_write: true,
+    audit_write: true,
+  };
+
+  // file-based config (no UI changes)
+  const cfgPath = path.join(appDataRoot(), "jarvis_permissions.json");
+  let fileCfg = {};
   try {
-    return !!(safeStorage && typeof safeStorage.isEncryptionAvailable === "function" && safeStorage.isEncryptionAvailable());
-  } catch (_) {
+    if (fs.existsSync(cfgPath)) {
+      const raw = fs.readFileSync(cfgPath, "utf8");
+      fileCfg = JSON.parse(raw);
+    }
+  } catch (_) { fileCfg = {}; }
+
+  // optional runtime override (if UI ever passes it)
+  const runtimeCfg = (opts && typeof opts.permissions === "object" && opts.permissions) ? opts.permissions : {};
+
+  return Object.assign({}, defaults, fileCfg || {}, runtimeCfg || {});
+}
+
+// ---------- Audit (append-only JSONL) ----------
+function auditAppendLine(lineObj, perms) {
+  if (!perms || perms.audit_write !== true) return;
+  const root = appDataRoot();
+  const dir = path.join(root, "audit");
+  const file = path.join(dir, "audit.jsonl");
+  safeMkdir(dir);
+  const row = JSON.stringify(lineObj) + "\n";
+  try { fs.appendFileSync(file, row, "utf8"); } catch (_) {}
+}
+
+function ssotPath(baseRoot) {
+  return path.join(String(baseRoot || process.cwd()), "SSOT_JARVIS.md");
+}
+
+function ensureSSOT(baseRoot) {
+  const p = ssotPath(baseRoot);
+  if (fs.existsSync(p)) return p;
+
+  const tmpl =
+`# JARVIS DESKTOP — SSOT (Single Source of Truth)
+
+**Last update:** ${nowISO()}
+**Runner version:** ${RUNNER_VERSION}
+
+## Goal
+JARVIS deve lavorare come “noi due”: search → read → plan → file ops → cmd step-by-step con permessi progressivi e proof/audit.
+
+Pilastri: **Tooling / Permessi / Proof-Audit**
+
+## Paths (SSOT)
+- Workspace: C:\\Users\\Utente\\TEST GPT HOME MADE\\versione 008\\JARVIS_ELECTRON_V1\\
+- Proofs runtime: %AppData%\\Roaming\\jarvis_electron_v1\\proofs\\RUN_*.json
+- Audit log: %AppData%\\Roaming\\jarvis_electron_v1\\audit\\audit.jsonl
+
+## Implemented features (log)
+(append-only)
+`;
+  writeFileProof(p, tmpl);
+  return p;
+}
+
+function ssotAppend(baseRoot, text, perms) {
+  if (!perms || perms.ssot_write !== true) return;
+  const p = ensureSSOT(baseRoot);
+  try {
+    const stamp = `\n- ${nowISO()} ${text}\n`;
+    fs.appendFileSync(p, stamp, "utf8");
+  } catch (_) {}
+}
+// ---------- WEB GUARD ----------
+function isPrivateOrReservedIP(ip) {
+  const v = net.isIP(ip);
+  if (!v) return true;
+
+  if (v === 4) {
+    const [a,b] = ip.split(".").map(n => parseInt(n,10));
+    if (a === 10) return true;
+    if (a === 127) return true;
+    if (a === 0) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true;
+    if (a >= 224) return true;
     return false;
   }
-}
 
-function setStoredApiKey(apiKey) {
-  try {
-    const k = String(apiKey || "").trim();
-    safeMkdir(userDataRoot());
-    const fp = apiKeyStorePath();
-
-    if (!k) {
-      try { if (fs.existsSync(fp)) fs.unlinkSync(fp); } catch (_) {}
-      try { auditEvent("APIKEY_STORE", { action: "cleared" }); } catch (_) {}
-      return { ok: true, cleared: true };
-    }
-
-    if (!canEncryptApiKey()) {
-      try { auditEvent("APIKEY_STORE", { action: "failed", reason: "ENCRYPTION_UNAVAILABLE" }); } catch (_) {}
-      return { ok: false, error: "ENCRYPTION_UNAVAILABLE" };
-    }
-
-    const buf = safeStorage.encryptString(k);
-    fs.writeFileSync(fp, buf.toString("base64"), "utf8");
-    try { auditEvent("APIKEY_STORE", { action: "set" }); } catch (_) {}
-    return { ok: true };
-  } catch (e) {
-    try { auditEvent("APIKEY_STORE", { action: "failed", reason: String(e && e.message ? e.message : e) }); } catch (_) {}
-    return { ok: false, error: "WRITE_FAILED" };
-  }
-}
-
-function getStoredApiKey() {
-  try {
-    const fp = apiKeyStorePath();
-    if (!fs.existsSync(fp)) return "";
-    if (!canEncryptApiKey()) return "";
-    const b64 = String(fs.readFileSync(fp, "utf8") || "").trim();
-    if (!b64) return "";
-    const buf = Buffer.from(b64, "base64");
-    return safeStorage.decryptString(buf);
-  } catch (_) {
-    return "";
-  }
-}
-
-function hasStoredApiKey() {
-  try { return !!String(getStoredApiKey() || "").trim(); } catch (_) { return false; }
-}
-
-function safeMkdir(p) {
-  try { fs.mkdirSync(p, { recursive: true }); } catch (_) {}
-}
-
-function sha256Hex(s) {
-  return crypto.createHash("sha256").update(String(s || ""), "utf8").digest("hex");
-}
-
-// -------------------- Audit log (hash-chained) --------------------
-function readAuditState() {
-  try {
-    const p = auditStatePath();
-    if (!fs.existsSync(p)) return { lastHash: "" };
-    const raw = fs.readFileSync(p, "utf8");
-    const j = JSON.parse(raw);
-    return { lastHash: String(j && j.lastHash ? j.lastHash : "") };
-  } catch (_) {
-    return { lastHash: "" };
-  }
-}
-
-function writeAuditState(lastHash) {
-  try {
-    safeMkdir(auditDir());
-    fs.writeFileSync(auditStatePath(), JSON.stringify({ lastHash: String(lastHash || "") }, null, 2), "utf8");
-  } catch (_) {}
-}
-
-function auditEvent(type, data) {
-  try {
-    safeMkdir(auditDir());
-    const st = readAuditState();
-    const prev = String(st.lastHash || "");
-    const ts = Date.now();
-    const payload = {
-      ts,
-      type: String(type || "UNKNOWN"),
-      data: (data && typeof data === "object") ? data : { value: String(data || "") },
-      prev_hash: prev,
-      hash: ""
-    };
-    const core = `${payload.ts}|${payload.type}|${JSON.stringify(payload.data)}|${payload.prev_hash}`;
-    payload.hash = sha256Hex(core);
-
-    fs.appendFileSync(auditFilePath(), JSON.stringify(payload) + "\n", "utf8");
-    writeAuditState(payload.hash);
-  } catch (_) {}
-}
-
-// -------------------- Config (permission decisions) --------------------
-function loadCfg() {
-  try {
-    const p = cfgPath();
-    if (!fs.existsSync(p)) return { permissions: {} };
-    const raw = fs.readFileSync(p, "utf8");
-    const j = JSON.parse(raw);
-    if (!j || typeof j !== "object") return { permissions: {} };
-    if (!j.permissions || typeof j.permissions !== "object") j.permissions = {};
-    return j;
-  } catch (_) {
-    return { permissions: {} };
-  }
-}
-
-function saveCfg(cfg) {
-  try {
-    const c = cfg && typeof cfg === "object" ? cfg : { permissions: {} };
-    if (!c.permissions || typeof c.permissions !== "object") c.permissions = {};
-    fs.writeFileSync(cfgPath(), JSON.stringify(c, null, 2), "utf8");
-  } catch (_) {}
-}
-
-function readRunnerPerms() {
-  try {
-    const p = runnerPermsPath();
-    if (!fs.existsSync(p)) return null;
-    const raw = fs.readFileSync(p, "utf8");
-    const j = JSON.parse(raw);
-    return (j && typeof j === "object") ? j : null;
-  } catch (_) {
-    return null;
-  }
-}
-
-// “Finestrella permessi”: DENY / ALLOW ONCE / ALWAYS ALLOW
-async function permRequest(className, whyText) {
-  const cfg = loadCfg();
-  const key = String(className || "").trim() || "unknown";
-  const cur = cfg.permissions[key];
-
-  if (cur === "allow") return { ok: true, decision: "allow", cached: true };
-  if (cur === "deny") return { ok: true, decision: "deny", cached: true };
-
-  const why = String(whyText || "").trim();
-  const r = await dialog.showMessageBox(win || null, {
-    type: "warning",
-    title: "JARVIS - Permission Required",
-    message: `Allow JARVIS to enable: ${key} ?`,
-    detail:
-      (why ? (`WHY: ${why}\n\n`) : "") +
-      "This enables autonomous actions on your PC for this class.\n" +
-      "NO UAC bypass.\n" +
-      "Any manual input (mouse move / Space) will trigger takeover + pause.\n\n" +
-      "Choose:",
-    buttons: ["DENY", "ALLOW ONCE", "ALWAYS ALLOW"],
-    defaultId: 0,
-    cancelId: 0
-  });
-
-  const resp = (r && typeof r.response === "number") ? r.response : 0;
-
-  // 0 deny, 1 allow once, 2 always allow
-  if (resp === 2) {
-    cfg.permissions[key] = "allow";
-    saveCfg(cfg);
-    auditEvent("PERMISSION_DECISION", { class: key, decision: "allow", mode: "always" });
-    return { ok: true, decision: "allow", cached: false };
-  }
-  if (resp === 1) {
-    auditEvent("PERMISSION_DECISION", { class: key, decision: "allow", mode: "once" });
-    return { ok: true, decision: "allow", cached: false, once: true };
-  }
-
-  cfg.permissions[key] = "deny";
-  saveCfg(cfg);
-  auditEvent("PERMISSION_DECISION", { class: key, decision: "deny", mode: "always" });
-  return { ok: true, decision: "deny", cached: false };
-}
-
-// -------------------- AUTOPILOT / Dead-man switch (global) --------------------
-let autopilotArmed = false;
-let manualOverride = false;
-let autopilotArmedAt = 0;
-
-// mouse movement detector
-let cursorTimer = null;
-let lastCursor = null;
-let ignoreMouseUntil = 0; // if AUTOPILOT moves cursor, it should set this window
-
-const MOUSE_DIST = 46;      // threshold (Manhattan distance)
-const POLL_MS = 90;
-const ARM_GRACE_MS = 1500;
-
-function startCursorWatch() {
-  stopCursorWatch();
-  lastCursor = screen.getCursorScreenPoint();
-  cursorTimer = setInterval(() => {
-    try {
-      if (!autopilotArmed) return;
-      const now = Date.now();
-      const p = screen.getCursorScreenPoint();
-      if (autopilotArmedAt && (now - autopilotArmedAt) < ARM_GRACE_MS) { lastCursor = p; return; }
-      if (!lastCursor) { lastCursor = p; return; }
-      const dist = Math.abs(p.x - lastCursor.x) + Math.abs(p.y - lastCursor.y);
-
-      // update baseline
-      lastCursor = p;
-
-      if (now < ignoreMouseUntil) return;
-      if (dist >= MOUSE_DIST) {
-        triggerManualTakeover("MOUSE_MOVE");
-      }
-    } catch (_) {}
-  }, POLL_MS);
-}
-
-function stopCursorWatch() {
-  if (cursorTimer) {
-    try { clearInterval(cursorTimer); } catch (_) {}
-    cursorTimer = null;
-  }
-}
-
-let registeredHotkey = "";
-function registerAutopilotHotkey() {
-  unregisterAutopilotHotkey();
-
-  // Try Space first. If Electron refuses, fallback to Ctrl+Space.
-  const tries = ["Space", "CommandOrControl+Space"];
-  for (const accel of tries) {
-    try {
-      const ok = globalShortcut.register(accel, () => {
-        if (autopilotArmed) triggerManualTakeover("SPACE");
-      });
-      if (ok) {
-        registeredHotkey = accel;
-        auditEvent("AUTOPILOT_HOTKEY_REGISTERED", { accelerator: accel });
-        return true;
-      }
-    } catch (_) {}
-  }
-
-  auditEvent("AUTOPILOT_HOTKEY_REGISTER_FAIL", { tried: tries });
+  const low = ip.toLowerCase();
+  if (low === "::1") return true;
+  if (low.startsWith("fe80:")) return true;
+  if (low.startsWith("fc") || low.startsWith("fd")) return true;
+  if (low.startsWith("::ffff:127.")) return true;
   return false;
 }
 
-function unregisterAutopilotHotkey() {
-  try {
-    if (registeredHotkey) {
-      globalShortcut.unregister(registeredHotkey);
-      auditEvent("AUTOPILOT_HOTKEY_UNREGISTERED", { accelerator: registeredHotkey });
-    }
-  } catch (_) {}
-  registeredHotkey = "";
-}
+async function assertPublicHost(host) {
+  const h = String(host || "").trim().toLowerCase();
+  if (!h) throw new Error("WEB_BAD_HOST");
+  if (h === "localhost" || h.endsWith(".local")) throw new Error("WEB_BLOCKED_HOST");
 
-function setAutopilotArmed(on, why) {
-  autopilotArmed = !!on;
-
-  if (!autopilotArmed) {
-    unregisterAutopilotHotkey();
-    stopCursorWatch();
-  } else {
-    autopilotArmedAt = Date.now();
-    ignoreMouseUntil = autopilotArmedAt + ARM_GRACE_MS;
-    try { lastCursor = screen.getCursorScreenPoint(); } catch (_) { lastCursor = null; }
-    registerAutopilotHotkey();
-    startCursorWatch();
+  if (net.isIP(h)) {
+    if (isPrivateOrReservedIP(h)) throw new Error("WEB_BLOCKED_IP");
+    return;
   }
 
-  auditEvent("AUTOPILOT_ARM_STATE", { armed: autopilotArmed, why: String(why || "") });
-  runner._setState();
-}
+  let ips = [];
+  try { ips = await dns.lookup(h, { all: true, verbatim: true }); }
+  catch (_) { throw new Error("WEB_DNS_FAIL"); }
 
-function triggerManualTakeover(why) {
-  if (!autopilotArmed) return;
-
-  manualOverride = true;
-  auditEvent("MANUAL_TAKEOVER", { why: String(why || "") });
-
-  // HARD RULE: disarm autopilot + pause runner immediately
-  setAutopilotArmed(false, "manual_takeover");
-  try { runner.pause(); } catch (_) {}
-  try { runner._log(`MANUAL TAKEOVER -> PAUSE (${why})`); } catch (_) {}
-
-  runner._send("jarvis:log", { ts: Date.now(), line: `MANUAL TAKEOVER -> PAUSE (${why})` });
-  runner._send("jarvis:state", runner.state());
-}
-
-// This is how AUTOPILOT actions should avoid self-pausing on mouse moves.
-function setInjectedIgnoreWindow(ms) {
-  const v = Number(ms || 0);
-  if (v > 0) {
-    ignoreMouseUntil = Date.now() + Math.min(4000, v);
-    auditEvent("AUTOPILOT_INJECT_IGNORE", { ms: v });
+  if (!ips || !ips.length) throw new Error("WEB_DNS_EMPTY");
+  for (const r of ips) {
+    if (r && r.address && isPrivateOrReservedIP(r.address)) throw new Error("WEB_BLOCKED_IP");
   }
 }
 
-// -------------------- Runner --------------------
-const runner = {
-  running: false,
-  paused: false,
-  stopRequested: false,
-  taskText: "",
-  steps: [],
-  error: "",
-  nextAction: "",
-  lastReport: "",
-  proofJsonPath: "",
-  _promise: null,
+function stripHtmlToText(html) {
+  let s = String(html || "");
+  s = s.replace(/<script[\s\S]*?<\/script>/gi, " ");
+  s = s.replace(/<style[\s\S]*?<\/style>/gi, " ");
+  s = s.replace(/<\/(p|div|br|li|h1|h2|h3|h4|h5|h6)>/gi, "\n");
+  s = s.replace(/<[^>]+>/g, " ");
+  s = s.replace(/&nbsp;/g, " ");
+  s = s.replace(/&amp;/g, "&");
+  s = s.replace(/&lt;/g, "<");
+  s = s.replace(/&gt;/g, ">");
+  s = s.replace(/\n{3,}/g, "\n\n");
+  s = s.replace(/[ \t]{2,}/g, " ");
+  return s.trim();
+}
 
-  _send(ch, payload) {
+async function readLimitedBody(body, maxBytes) {
+  if (!body) return Buffer.from("");
+  const reader = body.getReader ? body.getReader() : null;
+  if (!reader) {
+    const ab = await body.arrayBuffer();
+    const buf = Buffer.from(ab);
+    if (buf.length > maxBytes) throw new Error("WEB_TOO_LARGE");
+    return buf;
+  }
+  const chunks = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const b = Buffer.from(value);
+    total += b.length;
+    if (total > maxBytes) throw new Error("WEB_TOO_LARGE");
+    chunks.push(b);
+  }
+  return Buffer.concat(chunks);
+}
+
+async function webFetchGuarded(urlStr, opts) {
+  const maxBytes = opts.maxBytes || 900_000;
+  const timeoutMs = opts.timeoutMs || 8000;
+  const maxRedirects = opts.maxRedirects || 4;
+
+  let current = new URL(urlStr);
+  if (!/^https?:$/.test(current.protocol)) throw new Error("WEB_BAD_PROTOCOL");
+
+  for (let i = 0; i <= maxRedirects; i++) {
+    await assertPublicHost(current.hostname);
+
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), timeoutMs);
+    let res;
     try {
-      if (win && win.webContents) win.webContents.send(ch, payload);
+      res = await fetch(current.toString(), {
+        method: "GET",
+        redirect: "manual",
+        headers: {
+          "User-Agent": "JARVIS_ELECTRON_V1/1.0",
+          "Accept": "text/html,application/json,text/plain,*/*",
+        },
+        signal: ac.signal,
+      });
+    } catch (e) {
+      clearTimeout(t);
+      throw new Error(ac.signal.aborted ? "WEB_TIMEOUT" : "WEB_FETCH_FAIL");
+    }
+    clearTimeout(t);
+
+    const status = res.status;
+    const loc = res.headers.get("location");
+    const ct = res.headers.get("content-type") || "";
+
+    if (status >= 300 && status < 400 && loc) {
+      const next = new URL(loc, current);
+      if (!/^https?:$/.test(next.protocol)) throw new Error("WEB_BAD_PROTOCOL");
+      current = next;
+      continue;
+    }
+
+    const buf = await readLimitedBody(res.body, maxBytes);
+    const raw = buf.toString("utf8");
+    const text = /text\/html/i.test(ct) ? stripHtmlToText(raw) : raw;
+
+    return {
+      ok: true,
+      status,
+      finalUrl: current.toString(),
+      contentType: ct,
+      bytes: buf.length,
+      sha256: sha256Text(raw),
+      raw,
+      text,
+    };
+  }
+
+  throw new Error("WEB_TOO_MANY_REDIRECTS");
+}
+
+function parseWebCommand(taskText) {
+  const t = String(taskText || "").trim();
+  if (!t.toUpperCase().startsWith("WEB:")) return null;
+
+  const rest = t.slice(4).trim();
+  if (!rest) return { error: "WEB_EMPTY" };
+
+  const parts = rest.split("|").map(s => s.trim()).filter(Boolean);
+  const url = parts[0] || "";
+  const q = parts.slice(1).join(" | ").trim();
+  return { url, question: q };
+}
+
+// ---------- SEARCH (provider: Brave if key else DDG HTML) ----------
+function parseSearchCommand(taskText) {
+  const t = String(taskText || "").trim();
+  if (!t.toUpperCase().startsWith("SEARCH:")) return null;
+  const q = t.slice(7).trim();
+  if (!q) return { error: "SEARCH_EMPTY" };
+  return { query: q };
+}
+
+function extractAutoSearchQuery(taskText) {
+  const s0 = normOneLine(taskText);
+  if (!s0) return null;
+
+  const low = s0.toLowerCase();
+  if (low.startsWith("non cerc") || low.startsWith("non tro")) return null;
+  if (/https?:\/\/\S+/i.test(s0)) return null;
+
+  const patterns = [
+    [/^(cercami|cerca|trovami|trova)\s+(su\s+google\s+)?/i, ""],
+    [/^(informazioni|info)\s+su\s+/i, ""],
+    [/^(search|find|look\s*up)\s+/i, ""],
+  ];
+
+  for (const [re, rep] of patterns) {
+    if (re.test(s0)) {
+      const q = s0.replace(re, rep).trim();
+      return q || null;
+    }
+  }
+
+  const m = s0.match(/\b(cerca(mi)?|trova(mi)?)\b(?:\s+su\s+google|\s+online|\s+sul\s+web)?\s+(.+)$/i);
+  if (m && m[3]) {
+    const q = String(m[3]).trim();
+    return q || null;
+  }
+
+  return null;
+}
+
+function decodeHtmlEntitiesBasic(s) {
+  let t = String(s || "");
+  t = t.replace(/&nbsp;/g, " ");
+  t = t.replace(/&amp;/g, "&");
+  t = t.replace(/&quot;/g, '"');
+  t = t.replace(/&#39;/g, "'");
+  t = t.replace(/&lt;/g, "<");
+  t = t.replace(/&gt;/g, ">");
+  t = t.replace(/&#(\d+);/g, (_, n) => {
+    const code = parseInt(n, 10);
+    if (!isFinite(code)) return _;
+    try { return String.fromCharCode(code); } catch { return _; }
+  });
+  return t;
+}
+
+function stripTags(s) {
+  return decodeHtmlEntitiesBasic(String(s || "").replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").trim();
+}
+
+function normalizeDdgUrl(u) {
+  const s = String(u || "").trim();
+  try {
+    const url = new URL(s);
+    const uddg = url.searchParams.get("uddg");
+    if (uddg) return decodeURIComponent(uddg);
+  } catch (_) {}
+  return s;
+}
+
+function parseDdgHtmlResults(html, maxResults) {
+  const raw = String(html || "");
+  const results = [];
+  const linkRe = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+
+  let m;
+  while ((m = linkRe.exec(raw)) && results.length < maxResults) {
+    let url = stripTags(m[1] || "");
+    url = normalizeDdgUrl(url);
+    const title = stripTags(m[2] || "");
+    if (!url || !title) continue;
+
+    const windowStart = Math.max(0, m.index);
+    const windowEnd = Math.min(raw.length, m.index + 2000);
+    const chunk = raw.slice(windowStart, windowEnd);
+
+    let snippet = "";
+    const sn = chunk.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/(?:a|div)>/i);
+    if (sn && sn[1]) snippet = stripTags(sn[1]);
+
+    results.push({ title, url, snippet });
+  }
+  return results;
+}
+
+async function webSearch(query, opts) {
+  const q = String(query || "").trim();
+  if (!q) throw new Error("SEARCH_EMPTY");
+
+  const maxBytes = opts.maxBytes || 900_000;
+  const timeoutMs = opts.timeoutMs || 8000;
+  const count = Math.max(1, Math.min(8, opts.count || 5));
+  const braveKey = (opts.braveKey || process.env.BRAVE_SEARCH_API_KEY || "").trim();
+
+  if (braveKey) {
+    const u = new URL("https://api.search.brave.com/res/v1/web/search");
+    u.searchParams.set("q", q);
+    u.searchParams.set("count", String(count));
+
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), timeoutMs);
+    let res;
+    try {
+      await assertPublicHost(u.hostname);
+      res = await fetch(u.toString(), {
+        method: "GET",
+        headers: {
+          "User-Agent": "JARVIS_ELECTRON_V1/1.0",
+          "Accept": "application/json",
+          "X-Subscription-Token": braveKey,
+        },
+        signal: ac.signal,
+      });
+    } catch (e) {
+      clearTimeout(t);
+      throw new Error(ac.signal.aborted ? "WEB_TIMEOUT" : "WEB_FETCH_FAIL");
+    }
+    clearTimeout(t);
+
+    const buf = await readLimitedBody(res.body, maxBytes);
+    const raw = buf.toString("utf8");
+
+    let parsed;
+    try { parsed = JSON.parse(raw); } catch (_) { throw new Error("SEARCH_BAD_JSON"); }
+
+    const web = parsed && parsed.web && Array.isArray(parsed.web.results) ? parsed.web.results : [];
+    const results = web.slice(0, count).map((x) => ({
+      title: normOneLine(x && x.title ? x.title : ""),
+      url: String(x && (x.url || x.link) ? (x.url || x.link) : "").trim(),
+      snippet: normOneLine(x && (x.description || x.snippet) ? (x.description || x.snippet) : ""),
+    })).filter((x) => x.title && x.url);
+
+    return {
+      provider: "brave",
+      query: q,
+      results,
+      raw,
+      raw_sha256: sha256Text(raw),
+      raw_bytes: buf.length,
+      status: res.status,
+      contentType: res.headers.get("content-type") || "",
+    };
+  }
+
+  const ddgUrl = "https://html.duckduckgo.com/html/?q=" + encodeURIComponent(q);
+  const r = await webFetchGuarded(ddgUrl, { maxBytes, timeoutMs, maxRedirects: 2 });
+  const results = parseDdgHtmlResults(r.raw || "", count);
+  return {
+    provider: "ddg_html",
+    query: q,
+    results,
+    raw: r.raw || "",
+    raw_sha256: sha256Text(r.raw || ""),
+    raw_bytes: Buffer.byteLength(String(r.raw || ""), "utf8"),
+    status: r.status,
+    contentType: r.contentType,
+  };
+}
+function formatSearchForPrompt(searchObj) {
+  const provider = searchObj.provider || "unknown";
+  const results = Array.isArray(searchObj.results) ? searchObj.results : [];
+  const lines = [];
+  lines.push(`SEARCH_PROVIDER: ${provider}`);
+  lines.push(`SEARCH_QUERY: ${searchObj.query || ""}`);
+  lines.push(`SEARCH_RESULTS: ${results.length}`);
+  results.slice(0, 8).forEach((r, i) => {
+    lines.push(`${i + 1}. ${r.title || ""}`);
+    lines.push(`   URL: ${r.url || ""}`);
+    if (r.snippet) lines.push(`   SNIPPET: ${r.snippet}`);
+  });
+  return lines.join("\n");
+}
+
+// ---------- core ----------
+async function runTask(opts) {
+  const apiKey = String(opts.apiKey || process.env.OPENAI_API_KEY || process.env.JARVIS_OPENAI_API_KEY || "").trim();
+  const taskTextRaw = String(opts.taskText || "").trim();
+  const baseRoot = opts.baseRoot ? String(opts.baseRoot) : process.cwd();
+  const proofsDir = opts.proofsDir ? String(opts.proofsDir) : path.join(process.cwd(), "proofs");
+
+  const onLog = typeof opts.onLog === "function" ? opts.onLog : () => {};
+  const onStep = typeof opts.onStep === "function" ? opts.onStep : () => {};
+
+  const perms = loadPermissions(opts);
+
+  const MAX_TASK_CHARS = 2500;
+  const MAX_RULES_CHARS = 1600;
+  const MAX_TURNS = 10;
+  const MAX_HIST_CHARS = 360;
+  const MAX_WEB_CHARS = 9000;
+  const MAX_SEARCH_RAW_CHARS = 14000;
+
+  // Output token caps (NOT unlimited; bounded by model+context)
+  const MAX_OUT_CHAT  = parseInt(process.env.JARVIS_MAX_OUTPUT_TOKENS_CHAT  || "25000", 10);
+  const MAX_OUT_WEB   = parseInt(process.env.JARVIS_MAX_OUTPUT_TOKENS_WEB   || "25000", 10);
+  const MAX_OUT_TAURI = parseInt(process.env.JARVIS_MAX_OUTPUT_TOKENS_TAURI || "25000", 10);
+
+  if (!apiKey) return { ok: false, error: "NO_API_KEY", proofJsonPath: "", fileOps: [] };
+
+  const taskText = clip(taskTextRaw, MAX_TASK_CHARS);
+  const rulesUser = clip(String(opts.rulesText || ""), MAX_RULES_CHARS);
+
+  const history = compactHistory(opts.history, MAX_TURNS, MAX_HIST_CHARS);
+  const wantsTauri = wantsTauriAction(taskText);
+
+  const runId = makeRunId();
+  safeMkdir(proofsDir);
+  const proofJsonPath = path.join(proofsDir, `${runId}.json`);
+  const fileOps = [];
+  const auditEvents = [];
+
+  const step = (title, status, proof) => {
+    try { onStep({ title, status, proof: proof || "" }); } catch (_) {}
+    auditEvents.push({ kind: "step", at: nowISO(), runId, title, status, proof: proof || "" });
+  };
+
+  step("Runner version", "ok", RUNNER_VERSION);
+
+  // SSOT baseline init
+  ensureSSOT(baseRoot);
+
+  // Output policy: act like "noi due"
+  const outputPolicy =
+    "RULES:\n" +
+    "- Be direct and realistic.\n" +
+    "- If web was used: cite which SOURCE number (SOURCE_1, SOURCE_2) in plain text.\n" +
+    "- If insufficient web data: reply INSUFFICIENT_WEB_DATA.\n" +
+    "- If the user asks for execution: propose steps + ask for permission/confirm.\n";
+
+  const finalInstructions = `${outputPolicy}\n${rulesUser}`.trim();
+
+  let ctx = "";
+  if (history.length) {
+    const lines = history.map((m) => `${m.role === "assistant" ? "JARVIS" : "USER"}: ${m.content}`);
+    ctx = `HISTORY (last ${history.length} turns):\n${lines.join("\n")}\n\n`;
+  }
+
+  // --- MEMORY (local recall) ---
+  const memDbPath = path.join(appDataRoot(), "memory", "jarvis_memory.db");
+  let memoryContext = "";
+  try {
+    memory.init(memDbPath);
+    memoryContext = memory.buildContext(taskText, { limitRuns: 6, maxChars: 2500 });
+    if (memoryContext) ctx = `${ctx}${memoryContext}\n\n`;
+  } catch (_) { memoryContext = ""; }
+
+  // Audit header
+  auditAppendLine({ kind: "run_start", at: nowISO(), runId, runner_version: RUNNER_VERSION, taskText, perms }, perms);
+
+  // --- Action branch (tauri) ---
+  if (wantsTauri) {
+    if (perms.tauri_plan !== true) {
+      const err = "PERM_DENY_TAURI_PLAN";
+      step("Tauri plan", "error", err);
+      auditAppendLine({ kind: "run_end", at: nowISO(), runId, ok: false, error: err }, perms);
+      return { ok: false, error: err, proofJsonPath: "", fileOps: [] };
+    }
+
+    const tauriDir = path.join(baseRoot, "JARVIS_TAURI_V2");
+    safeMkdir(tauriDir);
+    step("Create folder JARVIS_TAURI_V2", "ok", tauriDir);
+
+    step("OpenAI call", "running", "Responses API");
+    const client = new OpenAI({ apiKey });
+
+    const fullInput = `${ctx}TASK:\n${taskText}`;
+
+    const resp = await client.responses.create({
+      model: "gpt-5.2",
+      instructions:
+        finalInstructions +
+        "\n\nProduce a practical plan for scaffolding a Tauri desktop app on Windows. " +
+        "Avoid interactive prompts. Include exact commands. Match Electron UI sections (tabs).",
+      input: fullInput,
+      max_output_tokens: MAX_OUT_TAURI,
+    });
+
+    const outTextRaw = resp && resp.output_text ? resp.output_text : "(no output_text)";
+    const outText = String(outTextRaw);
+    step("OpenAI call", "ok", `out_sha256=${sha256Text(outTextRaw)}`);
+
+    const planPath = path.join(tauriDir, "TAURI_PLAN.md");
+    const proof1 = writeFileProof(planPath, outText);
+    fileOps.push({ op: "write", ...proof1 });
+    step("Write TAURI_PLAN.md", "ok", `sha256=${proof1.sha256}`);
+
+    const readmePath = path.join(tauriDir, "README.md");
+    const readme = `# JARVIS_TAURI_V2\n\nGenerated by JARVIS Electron V1.\n\nRunId: ${runId}\nTask: ${taskText}\nPlan: TAURI_PLAN.md\n`;
+    const proof2 = writeFileProof(readmePath, readme);
+    fileOps.push({ op: "write", ...proof2 });
+    step("Write README.md", "ok", `sha256=${proof2.sha256}`);
+
+    const proofObj = {
+      ok: true, runId, at: nowISO(),
+      runner_version: RUNNER_VERSION,
+      feature_tag: "TAURI_PLAN",
+      taskText, history_count: history.length,
+      openai_model: "gpt-5.2",
+      output_sha256: sha256Text(outTextRaw),
+      perms,
+      fileOps,
+      audit_steps: auditEvents,
+    };
+    const proofJson = JSON.stringify(proofObj, null, 2);
+    const proof3 = writeFileProof(proofJsonPath, proofJson);
+    step("Write proof JSON", "ok", `sha256=${proof3.sha256}`);
+
+    // Flush audit + SSOT
+    auditEvents.forEach(ev => auditAppendLine(ev, perms));
+    auditAppendLine({ kind: "run_end", at: nowISO(), runId, ok: true, feature_tag: "TAURI_PLAN", proofJsonPath }, perms);
+    ssotAppend(baseRoot, `DONE_OK TAURI_PLAN runId=${runId} proof=${proofJsonPath}`, perms);
+
+    // --- MEMORY write-back ---
+
+
+    try {
+
+
+      const dbPath = path.join(appDataRoot(), "memory", "jarvis_memory.db");
+
+
+      memory.init(dbPath);
+
+
+      const ft = (typeof proofObj === "object" && proofObj && proofObj.feature_tag) ? proofObj.feature_tag : "CHAT";
+
+
+      memory.addItem({ runId, role: "user", content: taskText, proofJsonPath, meta: { feature_tag: ft, at: nowISO(), perms } });
+
+
+      memory.addItem({ runId, role: "assistant", content: clip(outText, 12000), proofJsonPath, meta: { feature_tag: ft, at: nowISO(), perms } });
+
+
     } catch (_) {}
-  },
 
-  _log(line) {
-    this._send("jarvis:log", { ts: Date.now(), line: String(line) });
-  },
 
-  _pushStep(title, status, proof) {
-    const step = { ts: Date.now(), title, status, proof: proof || "" };
-    this.steps.push(step);
-    this._send("jarvis:step", step);
-  },
+    onLog("DONE.");
+    return { ok: true, answer: outText, proofJsonPath, fileOps };
+  }
 
-  _setState() {
-    this._send("jarvis:state", this.state());
-  },
+  // --- SEARCH branch (explicit SEARCH: OR auto "cercami...") ---
+  const explicitSearch = parseSearchCommand(taskText);
+  const autoQ = !explicitSearch ? extractAutoSearchQuery(taskText) : null;
+  const searchQ = explicitSearch && !explicitSearch.error ? explicitSearch.query : autoQ;
 
-  _makeStopReport(reason) {
-    const last5 = this.steps
-      .slice(-5)
-      .map((s) => `- ${s.title} :: ${s.status}${s.proof ? " | " + s.proof : ""}`);
+  if (searchQ) {
+    if (perms.web_search !== true) {
+      const err = "PERM_DENY_WEB_SEARCH";
+      step("Web search", "error", err);
+      auditEvents.forEach(ev => auditAppendLine(ev, perms));
+      auditAppendLine({ kind: "run_end", at: nowISO(), runId, ok: false, error: err }, perms);
+      ssotAppend(baseRoot, `DENY web_search runId=${runId}`, perms);
+      return { ok: false, error: err, proofJsonPath, fileOps: [] };
+    }
 
-    const report =
-      `TASK: ${this.taskText || "(none)"}\n\n` +
-      `LAST 5 STEPS:\n${last5.length ? last5.join("\n") : "(no steps)"}\n\n` +
-      `ERROR/BLOCK: ${this.error || reason || "(none)"}\n\n` +
-      `NEXT ACTION: ${this.nextAction || "Retry after resolving the block or providing authorization."}\n\n` +
-      `PROOF JSON: ${this.proofJsonPath || "(none)"}`;
+    let searchRes;
+    try {
+      step("Web search", "running", "search");
+      searchRes = await webSearch(searchQ, {
+        count: 5,
+        timeoutMs: 8000,
+        maxBytes: 900_000,
+        braveKey: (opts.braveSearchKey || "").trim(),
+      });
+      step("Web search", "ok", `provider=${searchRes.provider} results=${(searchRes.results || []).length}`);
+    } catch (e) {
+      const err = e && e.message ? e.message : "SEARCH_FAIL";
+      step("Web search", "error", err);
+      const proofObj = { ok:false, runId, at: nowISO(), runner_version: RUNNER_VERSION, feature_tag: "WEB_SEARCH", taskText, error: err, perms, audit_steps: auditEvents };
+      writeFileProof(proofJsonPath, JSON.stringify(proofObj, null, 2));
+      auditEvents.forEach(ev => auditAppendLine(ev, perms));
+      auditAppendLine({ kind: "run_end", at: nowISO(), runId, ok: false, error: err, proofJsonPath }, perms);
+      ssotAppend(baseRoot, `ERROR web_search=${err} runId=${runId}`, perms);
+      return { ok:false, error: err, proofJsonPath, fileOps: [] };
+    }
 
-    // Definizione di finalInstructions per evitare errore
-    let finalInstructions = "Task completed successfully.";  // Può essere personalizzato
-    console.log(finalInstructions);  // Mostra o usa la variabile
+    // Save raw snapshot + results json
+    const searchDir = path.join(proofsDir, "web_search");
+    safeMkdir(searchDir);
 
-    this.lastReport = report;
-    return report;
-  },
+    const rawSnap = clip(searchRes.raw || "", MAX_SEARCH_RAW_CHARS);
+    const rawPath = path.join(searchDir, `${runId}_search_raw.txt`);
+    const rawProof = writeFileProof(rawPath, rawSnap);
+    fileOps.push({ op: "write", ...rawProof });
 
-  // Altri codici qui...
-};
+    const resultsPath = path.join(searchDir, `${runId}_search_results.json`);
+    const resultsObj = {
+      provider: searchRes.provider,
+      query: searchRes.query,
+      status: searchRes.status,
+      contentType: searchRes.contentType,
+      raw_bytes: searchRes.raw_bytes,
+      raw_sha256: searchRes.raw_sha256,
+      results: searchRes.results || [],
+    };
+    const resultsProof = writeFileProof(resultsPath, JSON.stringify(resultsObj, null, 2));
+    fileOps.push({ op: "write", ...resultsProof });
+    step("Write search proofs", "ok", `results_sha256=${resultsProof.sha256}`);
+
+    // Read top 2 sources (guarded), then answer
+    const sources = [];
+    if (perms.web_read === true) {
+      const top = (searchRes.results || []).slice(0, 2);
+      for (let i = 0; i < top.length; i++) {
+        const r = top[i];
+        const u = String(r && r.url ? r.url : "").trim();
+        if (!u || !/^https?:\/\//i.test(u)) continue;
+
+        try {
+          step("Web read", "running", `#${i + 1}`);
+          const webRes = await webFetchGuarded(u, { maxBytes: 900_000, timeoutMs: 8000, maxRedirects: 4 });
+
+          const webDir = path.join(proofsDir, "web");
+          safeMkdir(webDir);
+          const webText = clip(webRes.text || "", MAX_WEB_CHARS);
+          const snapPath = path.join(webDir, `${runId}_read_${i + 1}.txt`);
+          const snapProof = writeFileProof(snapPath, webText);
+          fileOps.push({ op: "write", ...snapProof });
+
+          sources.push({
+            idx: i + 1,
+            url: u,
+            finalUrl: webRes.finalUrl,
+            status: webRes.status,
+            sha256: webRes.sha256,
+            snapshot_path: snapPath,
+            snapshot_sha256: snapProof.sha256,
+            text: webText,
+          });
+
+          step("Web read", "ok", `#${i + 1} status=${webRes.status}`);
+        } catch (e) {
+          step("Web read", "error", `#${i + 1} ${(e && e.message) ? e.message : "WEB_READ_FAIL"}`);
+        }
+      }
+    } else {
+      step("Web read", "skipped", "PERM_DENY_WEB_READ");
+    }
+
+    const sourcesBlock = sources.length
+      ? sources.map(s =>
+          `SOURCE_${s.idx}:\nURL: ${s.finalUrl}\nSTATUS: ${s.status}\nSHA256: ${s.sha256}\nCONTENT:\n${s.text}\n`
+        ).join("\n")
+      : "NO_SOURCES_FETCHED.";
+
+    const client = new OpenAI({ apiKey });
+    const fullInput =
+      `${ctx}` +
+      `TASK:\n${taskText}\n\n` +
+      `${formatSearchForPrompt(searchRes)}\n\n` +
+      `SOURCES:\n${sourcesBlock}\n\n` +
+      `INSTRUCTION:\nAnswer the TASK using ONLY SOURCES. If insufficient: INSUFFICIENT_WEB_DATA.`;
+
+    step("OpenAI call", "running", "Responses API");
+    const resp = await client.responses.create({
+      model: "gpt-5.2",
+      instructions: finalInstructions,
+      input: fullInput,
+      max_output_tokens: MAX_OUT_WEB,
+    });
+
+    const outTextRaw = resp && resp.output_text ? resp.output_text : "(no output_text)";
+    const outText = String(outTextRaw).trim();
+    step("OpenAI call", "ok", `out_sha256=${sha256Text(outTextRaw)}`);
+
+    const proofObj = {
+      ok: true, runId, at: nowISO(),
+      runner_version: RUNNER_VERSION,
+      feature_tag: "WEB_SEARCH_ANSWER",
+      taskText,
+      history_count: history.length,
+      openai_model: "gpt-5.2",
+      output_sha256: sha256Text(outTextRaw),
+      perms,
+      search: {
+        provider: searchRes.provider,
+        query: searchRes.query,
+        status: searchRes.status,
+        contentType: searchRes.contentType,
+        raw_bytes: searchRes.raw_bytes,
+        raw_sha256: searchRes.raw_sha256,
+        raw_snapshot_path: rawPath,
+        raw_snapshot_sha256: rawProof.sha256,
+        results_path: resultsPath,
+        results_sha256: resultsProof.sha256,
+        results_count: (searchRes.results || []).length,
+      },
+      sources: sources.map(s => ({
+        idx: s.idx,
+        url: s.url,
+        finalUrl: s.finalUrl,
+        status: s.status,
+        sha256: s.sha256,
+        snapshot_path: s.snapshot_path,
+        snapshot_sha256: s.snapshot_sha256,
+      })),
+      fileOps,
+      audit_steps: auditEvents,
+    };
+
+    const proofJson = JSON.stringify(proofObj, null, 2);
+    const proof = writeFileProof(proofJsonPath, proofJson);
+    step("Write proof JSON", "ok", `sha256=${proof.sha256}`);
+
+    auditEvents.forEach(ev => auditAppendLine(ev, perms));
+    auditAppendLine({ kind: "run_end", at: nowISO(), runId, ok: true, feature_tag: "WEB_SEARCH_ANSWER", proofJsonPath }, perms);
+    ssotAppend(baseRoot, `DONE_OK WEB_SEARCH_ANSWER runId=${runId} proof=${proofJsonPath}`, perms);
+
+    // --- MEMORY write-back ---
+
+
+    try {
+
+
+      const dbPath = path.join(appDataRoot(), "memory", "jarvis_memory.db");
+
+
+      memory.init(dbPath);
+
+
+      const ft = (typeof proofObj === "object" && proofObj && proofObj.feature_tag) ? proofObj.feature_tag : "CHAT";
+
+
+      memory.addItem({ runId, role: "user", content: taskText, proofJsonPath, meta: { feature_tag: ft, at: nowISO(), perms } });
+
+
+      memory.addItem({ runId, role: "assistant", content: clip(outText, 12000), proofJsonPath, meta: { feature_tag: ft, at: nowISO(), perms } });
+
+
+    } catch (_) {}
+
+
+    onLog("DONE.");
+    return { ok: true, answer: outText, proofJsonPath, fileOps };
+  }
+
+  // --- WEB branch (explicit WEB:) ---
+  const webCmd = parseWebCommand(taskText);
+  if (webCmd && !webCmd.error) {
+    if (perms.web_fetch !== true) {
+      const err = "PERM_DENY_WEB_FETCH";
+      step("Web fetch", "error", err);
+      auditEvents.forEach(ev => auditAppendLine(ev, perms));
+      auditAppendLine({ kind: "run_end", at: nowISO(), runId, ok: false, error: err }, perms);
+      ssotAppend(baseRoot, `DENY web_fetch runId=${runId}`, perms);
+      return { ok:false, error: err, proofJsonPath, fileOps: [] };
+    }
+
+    let webRes;
+    try {
+      step("Web fetch", "running", "guarded_fetch");
+      webRes = await webFetchGuarded(webCmd.url, { maxBytes: 900_000, timeoutMs: 8000, maxRedirects: 4 });
+      step("Web fetch", "ok", `status=${webRes.status} bytes=${webRes.bytes}`);
+    } catch (e) {
+      const err = e && e.message ? e.message : "WEB_FAIL";
+      step("Web fetch", "error", err);
+      const proofObj = { ok:false, runId, at: nowISO(), runner_version: RUNNER_VERSION, feature_tag: "WEB_FETCH", taskText, error: err, perms, audit_steps: auditEvents };
+      writeFileProof(proofJsonPath, JSON.stringify(proofObj, null, 2));
+      auditEvents.forEach(ev => auditAppendLine(ev, perms));
+      auditAppendLine({ kind: "run_end", at: nowISO(), runId, ok: false, error: err, proofJsonPath }, perms);
+      ssotAppend(baseRoot, `ERROR web_fetch=${err} runId=${runId}`, perms);
+      return { ok:false, error: err, proofJsonPath, fileOps: [] };
+    }
+
+    const webDir = path.join(proofsDir, "web");
+    safeMkdir(webDir);
+    const webText = clip(webRes.text || "", MAX_WEB_CHARS);
+    const webSnapPath = path.join(webDir, `${runId}_web.txt`);
+    const webSnapProof = writeFileProof(webSnapPath, webText);
+    fileOps.push({ op: "write", ...webSnapProof });
+
+    const question = webCmd.question ? webCmd.question : "Riassumi i punti utili.";
+    const fullInput =
+      `${ctx}` +
+      `WEB_SOURCE_URL: ${webRes.finalUrl}\n` +
+      `WEB_SOURCE_STATUS: ${webRes.status}\n` +
+      `WEB_SOURCE_SHA256: ${webRes.sha256}\n` +
+      `WEB_CONTENT (truncated):\n${webText}\n\n` +
+      `USER_QUESTION:\n${question}`;
+
+    step("OpenAI call", "running", "Responses API");
+    const client = new OpenAI({ apiKey });
+
+    const resp = await client.responses.create({
+      model: "gpt-5.2",
+      instructions: finalInstructions + "\nUse ONLY WEB_CONTENT as your source. If insufficient: INSUFFICIENT_WEB_DATA.",
+      input: fullInput,
+      max_output_tokens: MAX_OUT_WEB,
+    });
+
+    const outTextRaw = resp && resp.output_text ? resp.output_text : "(no output_text)";
+    const outText = String(outTextRaw).trim();
+    step("OpenAI call", "ok", `out_sha256=${sha256Text(outTextRaw)}`);
+
+    const proofObj = {
+      ok: true, runId, at: nowISO(),
+      runner_version: RUNNER_VERSION,
+      feature_tag: "WEB_FETCH_ANSWER",
+      taskText,
+      history_count: history.length,
+      openai_model: "gpt-5.2",
+      output_sha256: sha256Text(outTextRaw),
+      perms,
+      web: {
+        url: webCmd.url,
+        finalUrl: webRes.finalUrl,
+        status: webRes.status,
+        contentType: webRes.contentType,
+        bytes: webRes.bytes,
+        sha256: webRes.sha256,
+        snapshot_path: webSnapPath,
+        snapshot_sha256: webSnapProof.sha256,
+      },
+      fileOps,
+      audit_steps: auditEvents,
+    };
+
+    const proofJson = JSON.stringify(proofObj, null, 2);
+    const proof = writeFileProof(proofJsonPath, proofJson);
+    step("Write proof JSON", "ok", `sha256=${proof.sha256}`);
+
+    auditEvents.forEach(ev => auditAppendLine(ev, perms));
+    auditAppendLine({ kind: "run_end", at: nowISO(), runId, ok: true, feature_tag: "WEB_FETCH_ANSWER", proofJsonPath }, perms);
+    ssotAppend(baseRoot, `DONE_OK WEB_FETCH_ANSWER runId=${runId} proof=${proofJsonPath}`, perms);
+
+    // --- MEMORY write-back ---
+
+
+    try {
+
+
+      const dbPath = path.join(appDataRoot(), "memory", "jarvis_memory.db");
+
+
+      memory.init(dbPath);
+
+
+      const ft = (typeof proofObj === "object" && proofObj && proofObj.feature_tag) ? proofObj.feature_tag : "CHAT";
+
+
+      memory.addItem({ runId, role: "user", content: taskText, proofJsonPath, meta: { feature_tag: ft, at: nowISO(), perms } });
+
+
+      memory.addItem({ runId, role: "assistant", content: clip(outText, 12000), proofJsonPath, meta: { feature_tag: ft, at: nowISO(), perms } });
+
+
+    } catch (_) {}
+
+
+    onLog("DONE.");
+    return { ok:true, answer: outText, proofJsonPath, fileOps };
+  }
+
+  // --- Chat branch (no web) ---
+  step("OpenAI call", "running", "Responses API");
+  const client = new OpenAI({ apiKey });
+  const fullInput = `${ctx}TASK:\n${taskText}`;
+
+  const resp = await client.responses.create({
+    model: "gpt-5.2",
+    instructions: finalInstructions,
+    input: fullInput,
+    max_output_tokens: MAX_OUT_CHAT,
+  });
+
+  const outTextRaw = resp && resp.output_text ? resp.output_text : "(no output_text)";
+  const outText = String(outTextRaw).trim();
+  step("OpenAI call", "ok", `out_sha256=${sha256Text(outTextRaw)}`);
+
+  const proofObj = {
+    ok: true, runId, at: nowISO(),
+    runner_version: RUNNER_VERSION,
+    feature_tag: "CHAT",
+    taskText, history_count: history.length,
+    openai_model: "gpt-5.2",
+    output_sha256: sha256Text(outTextRaw),
+    perms,
+    fileOps: [],
+    audit_steps: auditEvents,
+  };
+  const proofJson = JSON.stringify(proofObj, null, 2);
+  const proof = writeFileProof(proofJsonPath, proofJson);
+  step("Write proof JSON", "ok", `sha256=${proof.sha256}`);
+
+  auditEvents.forEach(ev => auditAppendLine(ev, perms));
+  auditAppendLine({ kind: "run_end", at: nowISO(), runId, ok: true, feature_tag: "CHAT", proofJsonPath }, perms);
+  ssotAppend(baseRoot, `DONE_OK CHAT runId=${runId} proof=${proofJsonPath}`, perms);
+
+  // --- MEMORY write-back ---
+
+
+  try {
+
+
+    const dbPath = path.join(appDataRoot(), "memory", "jarvis_memory.db");
+
+
+    memory.init(dbPath);
+
+
+    const ft = (typeof proofObj === "object" && proofObj && proofObj.feature_tag) ? proofObj.feature_tag : "CHAT";
+
+
+    memory.addItem({ runId, role: "user", content: taskText, proofJsonPath, meta: { feature_tag: ft, at: nowISO(), perms } });
+
+
+    memory.addItem({ runId, role: "assistant", content: clip(outText, 12000), proofJsonPath, meta: { feature_tag: ft, at: nowISO(), perms } });
+
+
+  } catch (_) {}
+
+
+  onLog("DONE.");
+  return { ok: true, answer: outText, proofJsonPath, fileOps: [] };
+}
+
+module.exports = { runTask };
