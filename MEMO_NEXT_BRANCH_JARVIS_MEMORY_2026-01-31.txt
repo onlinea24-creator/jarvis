@@ -1,0 +1,213 @@
+Di seguito la MEMO SSOT pronta per il ramo successivo (JARVIS Electron V1 / Memoria Locale).
+Include cosa ha ricevuto, cosa è stato fatto, stato reale, cosa manca, percorsi, backups, trappole.
+
+MEMO — NEXT BRANCH HANDOFF
+
+Progetto: JARVIS Electron V1 (memoria locale persistente)
+Data: 2026-01-31
+Root repo: C:\Users\Utente\TEST GPT HOME MADE\versione 008\JARVIS_ELECTRON_V1
+
+Obiettivo
+
+Trasformare JARVIS da “chat stateless” a assistente con memoria locale persistente:
+
+DB locale: SQLite + FTS5
+
+Recall prima della chiamata OpenAI: iniettare MEMORY_CONTEXT nel prompt
+
+Write-back dopo risposta: salvare task + answer + proofJsonPath + metadata
+
+Non rompere Proof/Audit/SSOT già esistenti.
+
+Stato iniziale ricevuto (verità)
+
+Proof/Audit già funzionanti su %APPDATA%\jarvis_electron_v1\proofs\RUN_*.json e audit jsonl.
+
+Verifica tool: HAS_NODE_SQLITE=YES e HAS_FTS5=YES.
+
+jarvis_cfg.json su %APPDATA%\jarvis_electron_v1\jarvis_cfg.json non conteneva apiKey (solo permissions).
+
+Cosa è stato implementato (fatto in questo ramo)
+1) Modulo memoria creato e testato
+
+File: memory_store.js nel root progetto
+Funzioni operative:
+
+init(dbPath)
+
+addItem({runId, role, content, proofJsonPath, meta})
+
+search(query, limit)
+
+buildContext(query, {limitRuns, maxChars}) → genera blocco MEMORY_CONTEXT (local recall)
+
+DB creato su disco:
+
+%APPDATA%\jarvis_electron_v1\memory\jarvis_memory.db
+
+Test OK (verificato):
+
+query hello memory test ritorna hits + buildContext mostra run_id e contenuti.
+
+2) Integrazione memoria dentro jarvis_runner.js
+
+File: jarvis_runner.js patchato per:
+
+require("./memory_store")
+
+Pre-OpenAI (Chat branch): costruzione MEMORY_CONTEXT e iniezione nel ctx/fullInput
+
+Post-OpenAI (write-back): salva nel DB:
+
+item user (task)
+
+item assistant (answer, clip)
+
+proofJsonPath
+
+meta: feature_tag, timestamp, perms
+
+Nota: è stato aggiunto anche skip memory per task che iniziano con SEARCH: o WEB: (evita contaminazioni / prompt troppo lungo).
+
+3) Policy risposta per usare memoria (prompting)
+
+outputPolicy aggiornato per includere regole:
+
+se presente MEMORY_CONTEXT: trattarlo come memoria locale
+
+se l’utente chiede “cosa ricordi / riferimenti al passato”: quotare righe rilevanti di MEMORY_CONTEXT con run_id + timestamp
+
+se non c’è niente: rispondere NO_RELEVANT_MEMORY
+
+4) Token output: non “illimitato”
+
+È stato richiesto “output illimitato”. Non esiste output illimitato: è sempre limitato da limite modello + contesto + policy API.
+
+Implementato workaround serio:
+
+rimpiazzati i max_output_tokens hardcoded (320/420/520/800) con cap configurabili via env:
+
+JARVIS_MAX_OUTPUT_TOKENS_CHAT (default 25000)
+
+JARVIS_MAX_OUTPUT_TOKENS_WEB (default 25000)
+
+JARVIS_MAX_OUTPUT_TOKENS_TAURI (default 25000)
+
+Se il valore è troppo alto per il modello, l’API può fallire → nel ramo successivo consigliato aggiungere fallback automatico.
+
+5) API key: fallback env aggiunto (runner)
+
+jarvis_runner.js ora prende API key da:
+
+opts.apiKey oppure
+
+process.env.OPENAI_API_KEY oppure
+
+process.env.JARVIS_OPENAI_API_KEY
+
+Importante: la UI salva la key in localStorage (jarvis_v1_cfg), ma %APPDATA%\jarvis_electron_v1\jarvis_cfg.json NON la contiene (al momento).
+
+Backups creati (SSOT)
+
+Nel root repo:
+
+jarvis_runner.js.bak_2026-01-31T09-36-41-555Z (patch memoria)
+
+jarvis_runner.js.bak_2026-01-31T09-39-13-628Z (fallback api key env)
+
+jarvis_runner.js.bak_2026-01-31T09-50-24-852Z (policy memoria + skip SEARCH/WEB)
+
+DB:
+
+%APPDATA%\jarvis_electron_v1\memory\jarvis_memory.db
+
+Proof esempio reale:
+
+%APPDATA%\jarvis_electron_v1\proofs\RUN_2026-01-31T09-42-01-531Z.json
+
+Problemi / trappole note
+
+NON esiste output illimitato. Va gestito con cap alto + fallback su errore.
+
+API key in chiaro: evitare assolutamente di incollarla in chat/log.
+(Il BOSS ha già cambiato key, ma regola SSOT: mai esporla).
+
+UI index.html usa localStorage (k: "jarvis_v1_cfg") per cfg.apiKey.
+jarvis_cfg.json su disco contiene solo permissions → mismatch.
+
+Warning node:sqlite experimental: solo warning, non blocca.
+
+Cosa deve fare il ramo successivo (priorità)
+P0 — Test “memoria vera” end-to-end (senza ambiguità)
+
+Avviare JARVIS e fare 2 run:
+
+task che salva info specifica (es. “Ricorda che il mio cane si chiama X”)
+
+task “Cosa ricordi sul cane?”
+
+Verificare che l’answer citi/quoti righe dal MEMORY_CONTEXT con run_id+timestamp.
+
+P1 — Fix persistenza API key su disco (senza cambiare UI)
+
+Obiettivo: quando la UI salva apiKey, scriverla anche su:
+
+%APPDATA%\jarvis_electron_v1\jarvis_cfg.json
+
+Approccio consigliato (no UI change):
+
+aggiungere IPC jarvis:cfg:set in main.js
+
+esporre in preload.js window.jarvis.setCfg({...})
+
+in index.html nel punto APIKEY_SAVED chiamare window.jarvis.setCfg({ apiKey: v })
+
+Regola: non loggare mai la key in proof/audit/console.
+
+(Opzione superiore, se vuoi sicurezza vera: keychain via keytar, ma è lavoro extra.)
+
+P2 — Hardening memoria
+
+Evitare write-back di answer troppo lunga → cap configurabile (es. JARVIS_MEMORY_MAX_CHARS).
+
+Aggiungere meta più pulito (feature_tag, perms, model, ts).
+
+Considerare “dedupe” per stessi testi ripetuti.
+
+P3 — Fallback tokens
+
+Se OpenAI ritorna errore per tokens troppo alti, retry con cap più basso (es. 8000).
+
+Percorsi importanti
+
+Repo: C:\Users\Utente\TEST GPT HOME MADE\versione 008\JARVIS_ELECTRON_V1
+
+Runtime userData: %APPDATA%\jarvis_electron_v1
+
+Proofs: %APPDATA%\jarvis_electron_v1\proofs\RUN_*.json
+
+Audit: %APPDATA%\jarvis_electron_v1\audit\audit.jsonl
+
+Memory DB: %APPDATA%\jarvis_electron_v1\memory\jarvis_memory.db
+
+Regole operative per il ramo successivo (non negoziabili)
+
+1 comando per messaggio
+
+Prima di un comando: indicare [CONTESTO | NOME_FINESTRA], “Dove / Cosa fare”
+
+Se serve un nuovo CMD: prima dare Win+R con cmd /k title ...
+
+Se un CMD non serve: dare comando exit
+
+Se si modifica un file: preferire “sostituisci tutto” e salvare backup.
+
+Comando per creare la memo su file (Notepad)
+
+[CONTESTO: Win+R | MEMO_NOTEPAD]
+1 comando (una riga):
+
+notepad "C:\Users\Utente\TEST GPT HOME MADE\versione 008\JARVIS_ELECTRON_V1\MEMO_NEXT_BRANCH_JARVIS_MEMORY_2026-01-31.txt"
+
+
+Poi: Ctrl+A, Canc, incolla tutto, Ctrl+S.

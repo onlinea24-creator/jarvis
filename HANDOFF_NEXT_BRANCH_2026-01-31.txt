@@ -1,0 +1,146 @@
+HANDOFF — JARVIS DESKTOP (Electron V1)
+Data: 2026-01-31 (Europe/Rome)
+
+OBIETTIVO / TASK DEL PROGETTO
+- Costruire JARVIS Desktop (Electron V1) come “assistente locale”.
+- Vincoli NON negoziabili:
+  1) Tray icon sempre presente con PAUSE/STOP.
+  2) STOP NON chiude l’app: genera “STOP REPORT” (task + ultimi 5 step + errore/blocco + next action + proof).
+  3) Autonomia stile “noi due” MA senza bypass UAC.
+  4) Proof/Audit: log append-only + file proof JSON per ogni run.
+
+CONTESTO UTENTE
+- L’utente NON è dev: vuole istruzioni chiare, 1 comando per volta, finestre nominate (CMD_JARVIS_RUN / CMD_JARVIS_CHECK ecc.).
+- Evitare parole “da dev” quando si spiega cosa fare; usare italiano semplice.
+- Regola: quando si dà un comando, dire anche quante righe di output deve incollare.
+
+PERCORSI IMPORTANTI (SSOT)
+- Project root:
+  C:\Users\Utente\TEST GPT HOME MADE\versione 008\JARVIS_ELECTRON_V1\
+- File main process Electron:
+  C:\Users\Utente\TEST GPT HOME MADE\versione 008\JARVIS_ELECTRON_V1\main.js
+- Runner:
+  C:\Users\Utente\TEST GPT HOME MADE\versione 008\JARVIS_ELECTRON_V1\jarvis_runner.js
+- AppData (config/audit/proofs):
+  C:\Users\Utente\AppData\Roaming\jarvis_electron_v1\
+  - Config UI permessi (attuale):
+    C:\Users\Utente\AppData\Roaming\jarvis_electron_v1\jarvis_cfg.json
+  - Config runner permessi (attuale):
+    C:\Users\Utente\AppData\Roaming\jarvis_electron_v1\jarvis_permissions.json
+  - Proof runs:
+    C:\Users\Utente\AppData\Roaming\jarvis_electron_v1\proofs\RUN_*.json
+  - Audit autopilot hash-chained:
+    C:\Users\Utente\AppData\Roaming\jarvis_electron_v1\proofs\audit\audit.jsonl
+    C:\Users\Utente\AppData\Roaming\jarvis_electron_v1\proofs\audit\audit_state.json
+  - NOTA: il runner ha anche un audit “suo” (da verificare) in:
+    C:\Users\Utente\AppData\Roaming\jarvis_electron_v1\audit\audit.jsonl  (se creato dal runner)
+
+STATO ATTUALE (COSA FUNZIONA)
+1) Tray presente e attivo (“Tray is active” visto dall’utente).
+2) Autopilot/Dead-man switch ESISTE in main.js:
+   - Arm/Disarm autopilot dal menu tray:
+     voce: “ARM AUTOPILOT (OS CONTROL)” e “DISARM AUTOPILOT”.
+   - Quando autopilot è armato:
+     - Hotkey registrata “Space” (audit event: AUTOPILOT_HOTKEY_REGISTERED).
+     - Mouse move / Space => “MANUAL TAKEOVER” => autopilot disarm + runner.pause() (audit events).
+3) Proof JSON per run generati correttamente in:
+   ...\AppData\Roaming\jarvis_electron_v1\proofs\RUN_*.json
+   (es: RUN_2026-01-30T22-08-20-596Z.json)
+
+PROBLEMA PRINCIPALE #1 — “OS CONTROL” NON AVVIENE DAVVERO
+- L’utente scrive: “APRI LA MAIL DEL PC”.
+- JARVIS risponde come ChatGPT (“non posso aprire outlook direttamente…”).
+- Motivo reale: nel runner, anche quando l’utente ha “os_control: allow”, NON esiste ancora un’implementazione di “apri outlook”/azioni OS.
+- Oltre a questo, i permessi di OS control nel runner non erano attivi (cmd_exec/download risultavano false nelle proof).
+
+PROBLEMA PRINCIPALE #2 — PERMESSI DOPPI / FILE DIVERSI
+- Esistono 2 sistemi di permessi separati:
+  A) jarvis_cfg.json (UI / os_control) -> contiene:
+     { "permissions": { "os_control": "allow" } }
+  B) jarvis_permissions.json (runner) -> decide flags:
+     web_search/web_fetch/web_read/tauri_plan/cmd_exec/download/ssot_write/audit_write
+- L’utente aveva os_control=allow ma il runner continuava a usare defaults:
+  cmd_exec=false e download=false dentro LATEST_PROOF perms.
+- Quindi la UI non “passa” i permessi al runner: il runner legge solo jarvis_permissions.json.
+
+AZIONI FATTE (SUCCESSI)
+1) Autopilot troppo “sensibile”: si disarmava quasi subito per movimento mouse.
+   - Patch applicata in main.js per “grace period” dopo arm:
+     - aggiunti:
+       autopilotArmedAt, ARM_GRACE_MS=1500, ignoreMouseUntil
+     - evita trigger immediato al primo polling.
+   - Backup creato automaticamente:
+     main.js.bak_20260130_224038
+
+2) Creazione permessi runner:
+   - Creato/aggiornato:
+     C:\Users\Utente\AppData\Roaming\jarvis_electron_v1\jarvis_permissions.json
+     con cmd_exec=true, download=true e flags fs_* aggiunti (anche se il runner non li usa ancora).
+   - Copiato anche dentro project:
+     C:\Users\Utente\TEST GPT HOME MADE\versione 008\JARVIS_ELECTRON_V1\jarvis_electron_v1\jarvis_permissions.json
+   - Riscritto JSON senza BOM per evitare problemi parsing (head bytes 123 13 10).
+
+RISULTATO ATTUALE (COSA NON TORNA ANCORA)
+- Anche dopo aver creato jarvis_permissions.json, nelle ultime proof il runner continua a mostrare:
+  cmd_exec=false, download=false
+  => o non sta leggendo il file giusto, o sta girando una build/istanza vecchia, o non è stato riavviato correttamente, o il file letto è diverso dal path atteso.
+
+NOTE IMPORTANTI SUI COMANDI/ERRORI CAPITATI (DA EVITARE)
+- “Select-Object non riconosciuto”: tipico quando si incolla un comando PowerShell ma il piping rompe le virgolette e viene interpretato dal CMD.
+  => Soluzione: in CMD incollare SOLO: powershell -NoProfile -Command " ... " (tutto dentro le virgolette, senza spezzare).
+- Errori PowerShell con “?” (ternary): non usare l’operatore “?:” perché su PS 5.1 dà parse error.
+- Errori tipo “Write-Outpu”: typo (manca la ‘t’ in Write-Output).
+- Electron “disk_cache access denied”: comparso quando avviato electron; non era bloccante per test, ma indica permessi/cartella cache.
+- Processi multipli electron/node: usati tasklist e taskkill per pulizia.
+
+COSA DEVE FARE IL PROSSIMO RAMO (NEXT ACTIONS, ORDINATE)
+1) Stabilire UNA SOLA fonte permessi (SSOT):
+   - Decisione consigliata: il runner usa SOLO jarvis_permissions.json (OK), ma va garantito che venga letto sempre dallo stesso path.
+   - In jarvis_runner.js: la funzione appDataRoot() usa %APPDATA%\jarvis_electron_v1 (corretto).
+   - Quindi jarvis_permissions.json deve stare QUI:
+     C:\Users\Utente\AppData\Roaming\jarvis_electron_v1\jarvis_permissions.json
+
+2) Debug “perché non viene letto”:
+   - Aggiungere log nel runner: “PERMS_LOADED_FROM=...” e “PERMS_EFFECTIVE=...”
+   - Loggare anche se file non esiste o JSON parse fail.
+   - Obiettivo: nella proof JSON deve apparire cmd_exec=true/download=true.
+
+3) Implementare davvero le azioni OS (senza UAC bypass):
+   - “Apri posta” = aprire l’app Mail/Outlook con un comando OS (es: start outlook / start mailto:).
+   - Questo richiede che runner abbia un modulo cmd_exec (child_process) con allowlist e audit per ogni comando.
+   - IMPORTANTE: non eseguire comandi pericolosi; usare allowlist (es: start outlook, start chrome, explorer).
+   - Se serve input UI (click), definire chiaramente che V1 è best-effort e richiede permessi accessibility.
+
+4) Permessi “file system” (organizza PC):
+   - L’utente vuole: scan, dedupe, quarantine, organize.
+   - Il runner oggi NON ha queste feature. I flag fs_* nel JSON sono solo “promesse”.
+   - Implementare in fasi:
+     - fs_scan: lista file/folder target
+     - fs_dedupe: report duplicati (NO delete)
+     - fs_quarantine: sposta in cartella quarantine
+     - fs_delete: rimane false by default (manual enable)
+
+5) UI/UX permessi (richiesta utente):
+   - L’utente chiede “finestrella permessi” quando serve, per autorizzare.
+   - Implementazione minima senza cambiare UI: usare dialog.showMessageBox nel main process quando una classe permesso manca.
+   - Salvare decisione su jarvis_cfg.json oppure unificare tutto su jarvis_permissions.json.
+
+6) Shortcut/icona per avvio JARVIS (richiesta utente):
+   - Serve un modo “click” per avviare JARVIS senza CMD.
+   - Soluzione temporanea: creare un file START_JARVIS.cmd nel project root e poi creare un collegamento sul Desktop.
+   - Soluzione corretta: packaging (electron-builder) -> exe installabile + icona + pin su taskbar.
+
+FATTI VERIFICATI (EVIDENZE)
+- Audit mostra eventi:
+  AUTOPILOT_HOTKEY_REGISTERED, AUTOPILOT_ARM_STATE, MANUAL_TAKEOVER, AUTOPILOT_HOTKEY_UNREGISTERED.
+- Proof JSON di run “APRI LA MAIL DEL PC” indica che era feature_tag CHAT e non OS control.
+- jarvis_runner.js defaults includono cmd_exec=false, download=false (linee ~57-68).
+
+REGOLE OPERATIVE PER IL PROSSIMO RAMO (DISCIPLINA)
+- 1 comando per volta, sempre specificando:
+  - [CONTESTO: WIN+R | NOME_FINESTRA] oppure [CONTESTO: CMD | CMD_JARVIS_RUN]
+- Dire quante righe di output incollare (es: “incolla ultime 30 righe”).
+- Se un comando fallisce: non ripeterlo uguale; cambiare strategia.
+- Se serve Notepad: dare Win+R per aprire il file specifico; se Notepad già aperto: Ctrl+A, Canc, incolla tutto, Ctrl+S.
+
+FINE HANDOFF

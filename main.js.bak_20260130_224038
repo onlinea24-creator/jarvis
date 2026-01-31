@@ -1,0 +1,615 @@
+﻿const {
+  app, BrowserWindow, ipcMain, Tray, Menu, Notification, dialog,
+  globalShortcut, screen
+} = require("electron");
+const path = require("path");
+const fs = require("fs");
+const crypto = require("crypto");
+
+const { runTask } = require("./jarvis_runner");
+
+let win = null;
+let tray = null;
+
+// -------------------- Disk cfg + Audit (hash-chained) --------------------
+function sha256(s) {
+  return crypto.createHash("sha256").update(String(s), "utf8").digest("hex");
+}
+function ensureDir(p) {
+  try { fs.mkdirSync(p, { recursive: true }); } catch (_) {}
+}
+
+function userDataPath(...parts) {
+  return path.join(app.getPath("userData"), ...parts);
+}
+
+function loadJson(p, fallback) {
+  try {
+    if (!fs.existsSync(p)) return fallback;
+    return JSON.parse(fs.readFileSync(p, "utf8"));
+  } catch (_) {
+    return fallback;
+  }
+}
+function saveJson(p, obj) {
+  try {
+    ensureDir(path.dirname(p));
+    fs.writeFileSync(p, JSON.stringify(obj, null, 2), "utf8");
+  } catch (_) {}
+}
+
+// permissions + runtime cfg on disk (NOT UI)
+const CFG_PATH = userDataPath("jarvis_cfg.json");
+function loadCfg() {
+  const c = loadJson(CFG_PATH, {});
+  c.permissions = c.permissions && typeof c.permissions === "object" ? c.permissions : {};
+  return c;
+}
+function saveCfg(c) {
+  saveJson(CFG_PATH, c || {});
+}
+
+// hash-chained audit log (append-only)
+const AUDIT_DIR = userDataPath("proofs", "audit");
+const AUDIT_LOG = path.join(AUDIT_DIR, "audit.jsonl");
+const AUDIT_STATE = path.join(AUDIT_DIR, "audit_state.json");
+
+function auditEvent(type, data) {
+  try {
+    ensureDir(AUDIT_DIR);
+    const st = loadJson(AUDIT_STATE, { lastHash: "" });
+    const ts = Date.now();
+    const payload = { ts, type: String(type), data: data || {}, prev_hash: st.lastHash || "" };
+    const h = sha256(payload.prev_hash + "|" + JSON.stringify({ ts: payload.ts, type: payload.type, data: payload.data }));
+    payload.hash = h;
+
+    fs.appendFileSync(AUDIT_LOG, JSON.stringify(payload) + "\n", "utf8");
+    st.lastHash = h;
+    saveJson(AUDIT_STATE, st);
+    return h;
+  } catch (_) {
+    return "";
+  }
+}
+
+// -------------------- AUTOPILOT / Dead-man switch (global) --------------------
+let autopilotArmed = false;
+let manualOverride = false;
+
+// mouse movement detector
+let cursorTimer = null;
+let lastCursor = null;
+let ignoreMouseUntil = 0; // if AUTOPILOT moves cursor, it should set this window
+
+const MOUSE_DIST = 46;      // threshold (Manhattan distance)
+const POLL_MS = 90;
+
+function startCursorWatch() {
+  stopCursorWatch();
+  lastCursor = screen.getCursorScreenPoint();
+  cursorTimer = setInterval(() => {
+    try {
+      if (!autopilotArmed) return;
+      const now = Date.now();
+      const p = screen.getCursorScreenPoint();
+      if (!lastCursor) { lastCursor = p; return; }
+      const dist = Math.abs(p.x - lastCursor.x) + Math.abs(p.y - lastCursor.y);
+
+      // update baseline
+      lastCursor = p;
+
+      if (now < ignoreMouseUntil) return;
+      if (dist >= MOUSE_DIST) {
+        // Dead-man triggered by physical cursor movement (best-effort)
+        triggerManualTakeover("MOUSE_MOVE");
+      }
+    } catch (_) {}
+  }, POLL_MS);
+}
+
+function stopCursorWatch() {
+  if (cursorTimer) {
+    try { clearInterval(cursorTimer); } catch (_) {}
+    cursorTimer = null;
+  }
+}
+
+let registeredHotkey = "";
+function registerAutopilotHotkey() {
+  unregisterAutopilotHotkey();
+
+  // We ONLY arm the global hotkey while autopilotArmed=true (so it doesn't break normal PC use).
+  // Try Space first. If Electron refuses, fallback to Ctrl+Space.
+  const tries = ["Space", "CommandOrControl+Space"];
+  for (const accel of tries) {
+    try {
+      const ok = globalShortcut.register(accel, () => {
+        if (autopilotArmed) triggerManualTakeover("SPACE");
+      });
+      if (ok) {
+        registeredHotkey = accel;
+        auditEvent("AUTOPILOT_HOTKEY_REGISTERED", { accelerator: accel });
+        return true;
+      }
+    } catch (_) {}
+  }
+
+  auditEvent("AUTOPILOT_HOTKEY_REGISTER_FAIL", { tried: tries });
+  return false;
+}
+
+function unregisterAutopilotHotkey() {
+  try {
+    if (registeredHotkey) {
+      globalShortcut.unregister(registeredHotkey);
+      auditEvent("AUTOPILOT_HOTKEY_UNREGISTERED", { accelerator: registeredHotkey });
+    }
+  } catch (_) {}
+  registeredHotkey = "";
+}
+
+async function permRequest(className) {
+  const cfg = loadCfg();
+  const key = String(className || "").trim() || "unknown";
+  const cur = cfg.permissions[key];
+
+  if (cur === "allow") return { ok: true, decision: "allow", cached: true };
+  if (cur === "deny") return { ok: true, decision: "deny", cached: true };
+
+  // strict: ask the human
+  const r = await dialog.showMessageBox(win || null, {
+    type: "warning",
+    title: "JARVIS - Permission Required",
+    message: `Allow JARVIS to enable: ${key} ?`,
+    detail:
+      "This enables autonomous actions on your PC for this class.\n" +
+      "NO UAC bypass. Any manual input will trigger takeover + pause.\n\n" +
+      "Choose Allow or Deny.",
+    buttons: ["DENY", "ALLOW"],
+    defaultId: 0,
+    cancelId: 0
+  });
+
+  const decision = (r && r.response === 1) ? "allow" : "deny";
+  cfg.permissions[key] = decision;
+  saveCfg(cfg);
+
+  auditEvent("PERMISSION_DECISION", { class: key, decision });
+  return { ok: true, decision, cached: false };
+}
+
+function setAutopilotArmed(on, why) {
+  autopilotArmed = !!on;
+
+  if (!autopilotArmed) {
+    unregisterAutopilotHotkey();
+    stopCursorWatch();
+  } else {
+    registerAutopilotHotkey();
+    startCursorWatch();
+  }
+
+  auditEvent("AUTOPILOT_ARM_STATE", { armed: autopilotArmed, why: String(why || "") });
+  runner._setState();
+}
+
+function triggerManualTakeover(why) {
+  if (!autopilotArmed) return;
+
+  manualOverride = true;
+  auditEvent("MANUAL_TAKEOVER", { why: String(why || "") });
+
+  // HARD RULE: disarm autopilot + pause runner immediately
+  setAutopilotArmed(false, "manual_takeover");
+  try { runner.pause(); } catch (_) {}
+  try { runner._log(`MANUAL TAKEOVER -> PAUSE (${why})`); } catch (_) {}
+
+  // notify UI (if listening)
+  runner._send("jarvis:log", { ts: Date.now(), line: `MANUAL TAKEOVER -> PAUSE (${why})` });
+  runner._send("jarvis:state", runner.state());
+}
+
+// This is how AUTOPILOT actions should avoid self-pausing on mouse moves.
+// When AUTOPILOT injects input, it should call this to set ignore window.
+function setInjectedIgnoreWindow(ms) {
+  const v = Number(ms || 0);
+  if (v > 0) {
+    ignoreMouseUntil = Date.now() + Math.min(4000, v);
+    auditEvent("AUTOPILOT_INJECT_IGNORE", { ms: v });
+  }
+}
+
+// -------------------- Runner --------------------
+const runner = {
+  running: false,
+  paused: false,
+  stopRequested: false,
+  taskText: "",
+  steps: [],
+  error: "",
+  nextAction: "",
+  lastReport: "",
+  proofJsonPath: "",
+  _promise: null,
+
+  _send(ch, payload) {
+    try {
+      if (win && win.webContents) win.webContents.send(ch, payload);
+    } catch (_) {}
+  },
+
+  _log(line) {
+    this._send("jarvis:log", { ts: Date.now(), line: String(line) });
+  },
+
+  _pushStep(title, status, proof) {
+    const step = { ts: Date.now(), title, status, proof: proof || "" };
+    this.steps.push(step);
+    this._send("jarvis:step", step);
+  },
+
+  _setState() {
+    this._send("jarvis:state", this.state());
+  },
+
+  _makeStopReport(reason) {
+    const last5 = this.steps
+      .slice(-5)
+      .map((s) => `- ${s.title} :: ${s.status}${s.proof ? " | " + s.proof : ""}`);
+
+    const report =
+      `TASK: ${this.taskText || "(none)"}\n\n` +
+      `LAST 5 STEPS:\n${last5.length ? last5.join("\n") : "(no steps)"}\n\n` +
+      `ERROR/BLOCK: ${this.error || reason || "(none)"}\n\n` +
+      `NEXT ACTION: ${this.nextAction || "Retry after resolving the block or providing authorization."}\n\n` +
+      `PROOF JSON: ${this.proofJsonPath || "(none)"}\n\n` +
+      `AUTOPILOT: armed=${autopilotArmed} manual_override=${manualOverride}`;
+
+    this.lastReport = report;
+    return report;
+  },
+
+  _showStopReport(reason) {
+    const report = this._makeStopReport(reason);
+
+    dialog.showMessageBox(win || null, {
+      type: "warning",
+      title: "JARVIS - STOP REPORT",
+      message: "Task stopped. Report below:",
+      detail: report,
+    });
+
+    try {
+      const n = new Notification({
+        title: "JARVIS - STOP",
+        body: "Task stopped. Open the app to see the report.",
+      });
+      n.show();
+    } catch (_) {}
+
+    this._send("jarvis:report", { ts: Date.now(), report });
+  },
+
+  start(taskText, apiKey, history, rulesText) {
+    const t = String(taskText || "").trim();
+    const k = String(apiKey || "").trim();
+
+    const hist = Array.isArray(history) ? history : [];
+    const rules = typeof rulesText === "string" ? rulesText : "";
+
+    if (!t) {
+      this._log("No task text provided.");
+      return { ok: false, error: "EMPTY_TASK" };
+    }
+    if (!k) {
+      this._log("API key missing.");
+      return { ok: false, error: "NO_API_KEY" };
+    }
+    if (this.running) {
+      this._log("Already running.");
+      return { ok: false, error: "ALREADY_RUNNING" };
+    }
+
+    manualOverride = false; // new run resets manual override
+
+    this.running = true;
+    this.paused = false;
+    this.stopRequested = false;
+    this.taskText = t;
+    this.steps = [];
+    this.error = "";
+    this.nextAction = "";
+    this.lastReport = "";
+    this.proofJsonPath = "";
+
+    auditEvent("RUN_START", { task: t });
+
+    this._log("START: " + this.taskText);
+    this._pushStep("Input received", "ok", "api_key_present=true");
+    this._setState();
+
+    const baseRoot = path.resolve(__dirname, "..");
+    const proofsDir = path.join(app.getPath("userData"), "proofs");
+
+    this._promise = (async () => {
+      try {
+        const res = await runTask({
+          apiKey: k,
+          taskText: t,
+          baseRoot,
+          proofsDir,
+          history: hist,
+          rulesText: rules,
+          onLog: (line) => this._log(line),
+          onStep: (s) => this._pushStep(s.title, s.status, s.proof || ""),
+          // future: OS tooling must check these:
+          isAutopilotArmed: () => autopilotArmed,
+          isManualOverride: () => manualOverride,
+          injectedIgnore: (ms) => setInjectedIgnoreWindow(ms)
+        });
+
+        if (this.stopRequested) {
+          this._log("Result ignored because STOP was requested.");
+          auditEvent("RUN_STOP_REQUESTED_IGNORE_RESULT", {});
+          this.running = false;
+          this.paused = false;
+          this._setState();
+          this._showStopReport(this.error || "STOP requested by user.");
+          return;
+        }
+
+        if (!res || !res.ok) {
+          this.error = res && res.error ? res.error : "RUN_FAILED";
+          this.nextAction = "Check API key / network and retry.";
+          auditEvent("RUN_FAIL", { error: this.error });
+          this.running = false;
+          this.paused = false;
+          this._setState();
+          this._showStopReport(this.error);
+          return;
+        }
+
+        this.proofJsonPath = res.proofJsonPath || "";
+        this._pushStep(
+          "Answer ready",
+          "ok",
+          this.proofJsonPath ? `proof=${this.proofJsonPath}` : ""
+        );
+
+        const answerText = res && res.answer ? String(res.answer) : "";
+
+        this._send("jarvis:answer", {
+          ts: Date.now(),
+          taskText: this.taskText,
+          answer: answerText,
+          proofJsonPath: this.proofJsonPath,
+        });
+
+        if (answerText) {
+          this._log("ANSWER (top):");
+          this._log(answerText.slice(0, 2500));
+        }
+
+        auditEvent("RUN_DONE", { proofJsonPath: this.proofJsonPath });
+
+        this.running = false;
+        this.paused = false;
+        this._setState();
+
+        const report =
+          `TASK: ${this.taskText}\n\n` +
+          `STATUS: DONE\n\n` +
+          `PROOF JSON: ${this.proofJsonPath || "(none)"}\n\n` +
+          `OUTPUT (full):\n${answerText || "(none)"}`;
+
+        this.lastReport = report;
+        this._send("jarvis:report", { ts: Date.now(), report });
+        return;
+      } catch (e) {
+        if (this.stopRequested) {
+          this.running = false;
+          this.paused = false;
+          this._setState();
+          this._showStopReport(this.error || "STOP requested by user.");
+          return;
+        }
+        this.error = e && e.message ? e.message : "EXCEPTION";
+        this.nextAction = "Retry. If it persists, check network/firewall and API key.";
+        auditEvent("RUN_EXCEPTION", { error: this.error });
+        this.running = false;
+        this.paused = false;
+        this._setState();
+        this._showStopReport(this.error);
+      }
+    })();
+
+    return { ok: true };
+  },
+
+  pause() {
+    if (!this.running) return { ok: false, error: "NOT_RUNNING" };
+    this.paused = true;
+    this._log("PAUSE requested (note: API call cannot be paused in V1).");
+    auditEvent("RUN_PAUSE", {});
+    this._setState();
+    return { ok: true };
+  },
+
+  resume() {
+    if (!this.running) return { ok: false, error: "NOT_RUNNING" };
+    this.paused = false;
+    manualOverride = false; // resume resets manual override
+    this._log("RESUME requested.");
+    auditEvent("RUN_RESUME", {});
+    this._setState();
+    return { ok: true };
+  },
+
+  stop(reason) {
+    this.stopRequested = true;
+    this.error = this.error || (reason || "STOP pressed by user.");
+    this.nextAction =
+      this.nextAction ||
+      "If you want me to proceed, re-run with explicit authorization where needed.";
+
+    auditEvent("RUN_STOP", { reason: this.error });
+
+    if (!this.running) {
+      this._log("STOP (no active run).");
+      this._showStopReport(this.error);
+      this._setState();
+      return { ok: true };
+    }
+
+    this._log("STOP requested. If an API call is running, it will finish then be ignored.");
+    this.running = false;
+    this.paused = false;
+    this._setState();
+    this._showStopReport(this.error);
+    return { ok: true };
+  },
+
+  state() {
+    return {
+      running: this.running,
+      paused: this.paused,
+      taskText: this.taskText,
+      stepsCount: this.steps.length,
+      proofJsonPath: this.proofJsonPath,
+      autopilotArmed,
+      manualOverride,
+      hotkey: registeredHotkey || ""
+    };
+  },
+};
+
+// -------------------- Window / Tray --------------------
+function createWindow() {
+  win = new BrowserWindow({
+    width: 980,
+    height: 720,
+    show: true,
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      preload: path.join(__dirname, "preload.js"),
+    },
+  });
+
+  win.loadFile(path.join(__dirname, "index.html"));
+
+  win.on("close", (e) => {
+    e.preventDefault();
+    win.hide();
+  });
+
+  return win;
+}
+
+function setupTray() {
+  tray = new Tray(path.join(__dirname, "tray.png"));
+  tray.setToolTip("JARVIS");
+
+  const menu = Menu.buildFromTemplate([
+    {
+      label: "PAUSE",
+      click: () => {
+        if (runner.running && !runner.paused) runner.pause();
+        else if (runner.running && runner.paused) runner.resume();
+      },
+    },
+    { label: "STOP", click: () => runner.stop("STOP pressed from tray.") },
+
+    { type: "separator" },
+
+    // NOTE: no UI changes. But this tray action is the correct way to ARM autopilot without changing index.html.
+    {
+      label: "ARM AUTOPILOT (OS CONTROL)",
+      click: async () => {
+        const pr = await permRequest("os_control");
+        if (pr.decision !== "allow") {
+          runner._log("AUTOPILOT_ARM denied by permission.");
+          return;
+        }
+        setAutopilotArmed(true, "tray_arm");
+        runner._log("AUTOPILOT ARMED. Space or human mouse move -> takeover+pause.");
+      },
+    },
+    {
+      label: "DISARM AUTOPILOT",
+      click: () => {
+        setAutopilotArmed(false, "tray_disarm");
+        runner._log("AUTOPILOT DISARMED.");
+      },
+    },
+
+    { type: "separator" },
+    {
+      label: "OPEN",
+      click: () => {
+        if (win) { win.show(); win.focus(); }
+      },
+    },
+    { label: "QUIT (only if you really want)", click: () => app.exit(0) },
+  ]);
+
+  tray.setContextMenu(menu);
+
+  tray.on("click", () => {
+    if (!win) return;
+    if (win.isMinimized()) win.restore();
+    win.show();
+    win.focus();
+  });
+}
+
+app.whenReady().then(() => {
+  app.setAppUserModelId("JARVIS");
+  createWindow();
+  setupTray();
+  auditEvent("APP_READY", {});
+});
+
+app.on("window-all-closed", (e) => {
+  if (e && typeof e.preventDefault === "function") e.preventDefault();
+});
+
+app.on("will-quit", () => {
+  try { globalShortcut.unregisterAll(); } catch (_) {}
+});
+
+// -------------------- IPC --------------------
+ipcMain.handle("jarvis:start", (_e, payload) => {
+  const taskText = payload && payload.taskText ? payload.taskText : "";
+  const apiKey = payload && payload.apiKey ? payload.apiKey : "";
+  const history = payload && Array.isArray(payload.history) ? payload.history : [];
+  const rulesText = payload && typeof payload.rulesText === "string" ? payload.rulesText : "";
+  return runner.start(taskText, apiKey, history, rulesText);
+});
+ipcMain.handle("jarvis:pause", () => runner.pause());
+ipcMain.handle("jarvis:resume", () => runner.resume());
+ipcMain.handle("jarvis:stop", (_e, reason) => runner.stop(reason));
+ipcMain.handle("jarvis:state", () => runner.state());
+
+// Autopilot controls (for future renderer/runner use)
+ipcMain.handle("jarvis:autopilot:arm", async (_e, why) => {
+  const pr = await permRequest("os_control");
+  if (pr.decision !== "allow") return { ok: false, error: "PERMISSION_DENY" };
+  setAutopilotArmed(true, why || "ipc_arm");
+  return { ok: true, armed: true, hotkey: registeredHotkey || "" };
+});
+ipcMain.handle("jarvis:autopilot:disarm", async (_e, why) => {
+  setAutopilotArmed(false, why || "ipc_disarm");
+  return { ok: true, armed: false };
+});
+ipcMain.handle("jarvis:autopilot:injected", async (_e, ms) => {
+  setInjectedIgnoreWindow(ms);
+  return { ok: true };
+});
+ipcMain.handle("jarvis:perm:request", async (_e, className) => {
+  return permRequest(className);
+});
+ipcMain.handle("jarvis:manual:takeover", async (_e, why) => {
+  triggerManualTakeover(why || "ipc");
+  return { ok: true };
+});

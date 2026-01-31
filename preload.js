@@ -1,0 +1,452 @@
+const { contextBridge, ipcRenderer } = require("electron");
+
+/**
+ * Exposed API (keeps compatibility + adds chat/answer wiring).
+ */
+const jarvisAPI = {
+  start: (taskText, apiKey, history, rulesText) =>
+    ipcRenderer.invoke("jarvis:start", { taskText, apiKey, history, rulesText }),
+  pause: () => ipcRenderer.invoke("jarvis:pause"),
+  resume: () => ipcRenderer.invoke("jarvis:resume"),
+  stop: (reason) => ipcRenderer.invoke("jarvis:stop", reason),
+  state: () => ipcRenderer.invoke("jarvis:state"),
+
+  setApiKey: (apiKey) => ipcRenderer.invoke("jarvis:setApiKey", { apiKey }),
+  hasApiKey: () => ipcRenderer.invoke("jarvis:hasApiKey"),
+
+  onLog: (cb) => ipcRenderer.on("jarvis:log", (_e, p) => cb(p)),
+  onStep: (cb) => ipcRenderer.on("jarvis:step", (_e, p) => cb(p)),
+  onState: (cb) => ipcRenderer.on("jarvis:state", (_e, p) => cb(p)),
+  onReport: (cb) => ipcRenderer.on("jarvis:report", (_e, p) => cb(p)),
+  onAnswer: (cb) => ipcRenderer.on("jarvis:answer", (_e, p) => cb(p)),
+};
+
+contextBridge.exposeInMainWorld("jarvis", jarvisAPI);
+
+// --- helpers (UI auto-wire, tooltips, etc.) ---
+function _qs(sel, root = document) {
+  try { return root.querySelector(sel); } catch { return null; }
+}
+function _qsa(sel, root = document) {
+  try { return Array.from(root.querySelectorAll(sel)); } catch { return []; }
+}
+
+function findTaskInput() {
+  return (
+    _qs("#taskText") ||
+    _qs("textarea[name*=task i]") ||
+    _qs("textarea[id*=task i]") ||
+    _qs("textarea") ||
+    _qs("input[type=text]") ||
+    _qs("input")
+  );
+}
+
+function findApiKeyInput() {
+  return (
+    _qs("#apiKey") ||
+    _qs("input[type=password]") ||
+    _qs("input[name*=api i]") ||
+    _qs("input[id*=api i]") ||
+    null
+  );
+}
+
+function findRulesInput() {
+  return (
+    _qs("#rulesText") ||
+    _qs("textarea[name*=rules i]") ||
+    _qs("textarea[id*=rules i]") ||
+    null
+  );
+}
+
+function normLabel(s) {
+  return String(s || "").replace(/\s+/g, " ").trim();
+}
+
+function btnLabel(btn) {
+  return normLabel(btn.getAttribute("aria-label") || btn.textContent || btn.value || "");
+}
+
+function findButtons() {
+  // Only real <button> to avoid breaking other clickable elements.
+  return _qsa("button");
+}
+
+function pickButton(buttons, matcher) {
+  for (const b of buttons) {
+    const id = (b.id || "").toLowerCase();
+    const txt = btnLabel(b).toLowerCase();
+    if (matcher({ id, txt, el: b })) return b;
+  }
+  return null;
+}
+
+function findOutputContainer() {
+  return (
+    _qs("#chat") ||
+    _qs("#messages") ||
+    _qs("#conversation") ||
+    _qs("#history") ||
+    _qs("#log") ||
+    _qs("#console") ||
+    _qs("pre") ||
+    _qs("textarea[readonly]") ||
+    _qs("textarea") ||
+    null
+  );
+}
+
+function outputAppendLine(outEl, line) {
+  if (!outEl) return;
+
+  const isTextArea = outEl.tagName === "TEXTAREA" || outEl.tagName === "INPUT";
+  if (isTextArea) {
+    const prev = outEl.value || "";
+    outEl.value = prev ? (prev + "\n" + line) : line;
+    outEl.scrollTop = outEl.scrollHeight;
+    return;
+  }
+
+  if (outEl.tagName === "PRE") {
+    outEl.textContent = (outEl.textContent || "") + (outEl.textContent ? "\n" : "") + line;
+    outEl.scrollTop = outEl.scrollHeight;
+    return;
+  }
+
+  const row = document.createElement("div");
+  row.textContent = line;
+  row.style.whiteSpace = "pre-wrap";
+  outEl.appendChild(row);
+  outEl.scrollTop = outEl.scrollHeight;
+}
+
+const LS_KEY = "jarvis_chat_history_v1";
+function loadHistory() {
+  try {
+    const raw = localStorage.getItem(LS_KEY);
+    const arr = raw ? JSON.parse(raw) : [];
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    return [];
+  }
+}
+function saveHistory(hist) {
+  try {
+    const capped = Array.isArray(hist) ? hist.slice(-40) : [];
+    localStorage.setItem(LS_KEY, JSON.stringify(capped));
+  } catch (_) {}
+}
+
+function renderFullHistory(outEl, hist) {
+  if (!outEl) return;
+
+  const isTextArea = outEl.tagName === "TEXTAREA" || outEl.tagName === "INPUT";
+  if (isTextArea) {
+    outEl.value = "";
+  } else if (outEl.tagName === "PRE") {
+    outEl.textContent = "";
+  } else {
+    outEl.innerHTML = "";
+  }
+
+  for (const m of hist) {
+    const role = m.role === "assistant" ? "JARVIS" : "YOU";
+    const text = String(m.content || "");
+    outputAppendLine(outEl, `${role}: ${text}`);
+  }
+}
+
+function tooltipTextForButton(labelLower) {
+  if (labelLower.includes("start") || labelLower.includes("run") || labelLower.includes("send") || labelLower.includes("go")) {
+    return "Avvia task usando API Key + contesto.";
+  }
+  if (labelLower.includes("pause")) return "Pausa/Resume.";
+  if (labelLower.includes("resume")) return "Riprende dopo PAUSE.";
+  if (labelLower.includes("stop")) return "STOP: ferma + report.";
+  if (labelLower.includes("clear") || labelLower.includes("reset")) return "Pulisce console/chat locale.";
+  if (labelLower.includes("rules")) return "Regole operative.";
+  if (labelLower.includes("api")) return "API Key.";
+  if (labelLower.includes("chat") || labelLower.includes("console") || labelLower.includes("log")) return "Output.";
+  return labelLower ? `Pulsante: ${labelLower}` : "Pulsante";
+}
+
+function installTooltipsOnButtons(buttons) {
+  if (!buttons || !buttons.length) return;
+
+  let tip = document.getElementById("jarvis_tip_box");
+  if (!tip) {
+    tip = document.createElement("div");
+    tip.id = "jarvis_tip_box";
+    tip.style.position = "fixed";
+    tip.style.zIndex = "999999";
+    tip.style.maxWidth = "340px";
+    tip.style.padding = "8px 10px";
+    tip.style.borderRadius = "8px";
+    tip.style.fontSize = "12px";
+    tip.style.lineHeight = "1.25";
+    tip.style.background = "rgba(0,0,0,0.85)";
+    tip.style.color = "#fff";
+    tip.style.display = "none";
+    tip.style.pointerEvents = "none";
+    document.body.appendChild(tip);
+  }
+
+  let timer = null;
+
+  function showTip(text, anchorRect) {
+    tip.textContent = text;
+    tip.style.display = "block";
+
+    const pad = 8;
+    const x = Math.min(window.innerWidth - pad, Math.max(pad, anchorRect.left + anchorRect.width + 8));
+    const y = Math.min(window.innerHeight - pad, Math.max(pad, anchorRect.top));
+
+    tip.style.left = x + "px";
+    tip.style.top = y + "px";
+  }
+  function hideTip() {
+    tip.style.display = "none";
+  }
+
+  for (const btn of buttons) {
+    if (btn.__jarvisInfoInstalled) continue;
+    btn.__jarvisInfoInstalled = true;
+
+    if (getComputedStyle(btn).position === "static") btn.style.position = "relative";
+
+    const info = document.createElement("span");
+    info.textContent = "i";
+    info.setAttribute("aria-hidden", "true");
+    info.style.position = "absolute";
+    info.style.right = "6px";
+    info.style.top = "4px";
+    info.style.width = "14px";
+    info.style.height = "14px";
+    info.style.borderRadius = "999px";
+    info.style.display = "inline-flex";
+    info.style.alignItems = "center";
+    info.style.justifyContent = "center";
+    info.style.fontSize = "10px";
+    info.style.fontWeight = "700";
+    info.style.opacity = "0.7";
+    info.style.userSelect = "none";
+    info.style.pointerEvents = "auto";
+    info.style.border = "1px solid currentColor";
+    info.style.color = "currentColor";
+    info.style.background = "transparent";
+
+    info.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+    });
+
+    const label = btnLabel(btn);
+    const tipText = tooltipTextForButton(label.toLowerCase());
+
+    info.addEventListener("mouseenter", () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        const r = info.getBoundingClientRect();
+        showTip(tipText, r);
+      }, 250);
+    });
+    info.addEventListener("mouseleave", () => {
+      if (timer) clearTimeout(timer);
+      hideTip();
+    });
+
+    btn.addEventListener("mouseleave", () => {
+      if (timer) clearTimeout(timer);
+      hideTip();
+    });
+
+    btn.appendChild(info);
+  }
+}
+
+// ----------------- MANUAL TAKEOVER (SPACE + MOUSE MOVE) -----------------
+function _isTypingContext(el) {
+  const a = el || document.activeElement;
+  if (!a) return false;
+  const tag = (a.tagName || "").toLowerCase();
+  if (tag === "textarea" || tag === "input" || tag === "select") return true;
+  if (a.isContentEditable) return true;
+  return false;
+}
+
+window.addEventListener("DOMContentLoaded", async () => {
+  const taskEl = findTaskInput();
+  const apiEl = findApiKeyInput();
+  const rulesEl = findRulesInput();
+  const buttons = findButtons();
+  const outEl = findOutputContainer();
+
+  installTooltipsOnButtons(buttons);
+
+  let history = loadHistory();
+  if (outEl && history.length) renderFullHistory(outEl, history);
+
+  const startBtn =
+    _qs("#startBtn") ||
+    pickButton(buttons, ({ id, txt }) => id.includes("start") || id.includes("run") || txt.includes("start") || txt.includes("run") || txt.includes("send"));
+  const pauseBtn =
+    _qs("#pauseBtn") ||
+    pickButton(buttons, ({ id, txt }) => id.includes("pause") || txt.includes("pause"));
+  const resumeBtn =
+    _qs("#resumeBtn") ||
+    pickButton(buttons, ({ id, txt }) => id.includes("resume") || txt.includes("resume"));
+  const stopBtn =
+    _qs("#stopBtn") ||
+    pickButton(buttons, ({ id, txt }) => id.includes("stop") || txt.includes("stop"));
+  const clearBtn =
+    _qs("#clearBtn") ||
+    pickButton(buttons, ({ id, txt }) => id.includes("clear") || id.includes("reset") || txt.includes("clear") || txt.includes("reset"));
+
+  function pushMsg(role, content) {
+    const msg = { role, content: String(content || ""), ts: Date.now() };
+    history.push(msg);
+    saveHistory(history);
+    if (outEl) outputAppendLine(outEl, `${role === "assistant" ? "JARVIS" : "YOU"}: ${msg.content}`);
+  }
+
+  async function doStart() {
+    const taskText = taskEl ? String(taskEl.value || taskEl.textContent || "").trim() : "";
+    const apiKey = apiEl ? String(apiEl.value || "").trim() : "";
+    const rulesText = rulesEl ? String(rulesEl.value || rulesEl.textContent || "") : "";
+
+    if (!taskText) return;
+    if (!apiKey) {
+      try {
+        const has = (window.jarvis && typeof window.jarvis.hasApiKey === "function")
+          ? await window.jarvis.hasApiKey()
+          : false;
+        if (!has) {
+          if (outEl) outputAppendLine(outEl, "JARVIS: API key missing.");
+          return;
+        }
+        if (outEl) outputAppendLine(outEl, "JARVIS: using stored API key.");
+      } catch (_) {
+        if (outEl) outputAppendLine(outEl, "JARVIS: API key missing.");
+        return;
+      }
+    }
+
+    pushMsg("user", taskText);
+
+    const histToSend = history.slice(-12).map((m) => ({ role: m.role, content: m.content }));
+
+    try {
+      await window.jarvis.start(taskText, apiKey, histToSend, rulesText);
+    } catch (e) {
+      if (outEl) outputAppendLine(outEl, "JARVIS: start failed: " + (e && e.message ? e.message : "ERROR"));
+    }
+  }
+
+  if (startBtn) startBtn.addEventListener("click", (e) => { e.preventDefault(); doStart(); });
+  if (pauseBtn) pauseBtn.addEventListener("click", (e) => { e.preventDefault(); window.jarvis.pause(); });
+  if (resumeBtn) resumeBtn.addEventListener("click", (e) => { e.preventDefault(); window.jarvis.resume(); });
+  if (stopBtn) stopBtn.addEventListener("click", (e) => { e.preventDefault(); window.jarvis.stop("STOP pressed from UI."); });
+
+  if (clearBtn) {
+    clearBtn.addEventListener("click", (e) => {
+      e.preventDefault();
+      history = [];
+      saveHistory(history);
+      if (outEl) renderFullHistory(outEl, history);
+    });
+  }
+
+  // ---- manual takeover state (local) ----
+  let manualOverride = false;
+  let lastState = { running: false, paused: false };
+  let lastMouse = null; // {x,y,ts}
+  const MOUSE_DIST = 42;      // threshold
+  const MOUSE_MIN_MS = 80;    // ignore ultra-jitter
+
+  function setManual(on, why) {
+    manualOverride = !!on;
+    if (outEl) outputAppendLine(outEl, `JARVIS: MANUAL_OVERRIDE=${manualOverride ? "ON" : "OFF"}${why ? " (" + why + ")" : ""}`);
+  }
+
+  function tryManualPause(why) {
+    if (!window.jarvis) return;
+    if (!lastState || !lastState.running) return;
+    if (lastState.paused) return;
+    if (manualOverride) return;
+
+    manualOverride = true;
+    window.jarvis.pause();
+    if (outEl) outputAppendLine(outEl, `JARVIS: MANUAL TAKEOVER -> PAUSE (${why})`);
+  }
+
+  // SPACE => PAUSE (unless typing)
+  document.addEventListener("keydown", (e) => {
+    try {
+      if (!e) return;
+      if (e.code !== "Space") return;
+      if (_isTypingContext(e.target)) return; // allow space while typing
+      if (e.ctrlKey || e.altKey || e.metaKey) return;
+      e.preventDefault();
+      tryManualPause("SPACE");
+    } catch (_) {}
+  }, true);
+
+  // Mouse move => PAUSE when RUNNING (real movement)
+  document.addEventListener("mousemove", (e) => {
+    try {
+      if (!e) return;
+      if (!lastState || !lastState.running) return;
+      if (lastState.paused) return;
+      if (manualOverride) return;
+
+      const now = Date.now();
+      const x = typeof e.screenX === "number" ? e.screenX : e.clientX;
+      const y = typeof e.screenY === "number" ? e.screenY : e.clientY;
+
+      if (!lastMouse) {
+        lastMouse = { x, y, ts: now };
+        return;
+      }
+      const dt = now - lastMouse.ts;
+      const dx = Math.abs(x - lastMouse.x);
+      const dy = Math.abs(y - lastMouse.y);
+
+      // refresh baseline periodically
+      if (dt > 350) lastMouse = { x, y, ts: now };
+
+      if (dt < MOUSE_MIN_MS) return;
+      if ((dx + dy) >= MOUSE_DIST) {
+        tryManualPause("MOUSE_MOVE");
+      }
+    } catch (_) {}
+  }, true);
+
+  // Listen to real answer => push to chat
+  window.jarvis.onAnswer((p) => {
+    const ans = p && p.answer ? String(p.answer) : "";
+    if (ans) pushMsg("assistant", ans);
+  });
+
+  // Track state + clear manualOverride on resume/stop
+  window.jarvis.onState((st) => {
+    try {
+      lastState = st || { running: false, paused: false };
+      if (startBtn) startBtn.disabled = !!(st && st.running);
+
+      // If stopped OR resumed => manual override OFF
+      if (!st || !st.running) {
+        if (manualOverride) setManual(false, "STOPPED");
+      } else if (st.running && st.paused === false) {
+        if (manualOverride) setManual(false, "RESUMED");
+      }
+    } catch (_) {}
+  });
+
+  window.jarvis.onLog((p) => {
+    if (!outEl) return;
+    const line = p && p.line ? String(p.line) : "";
+    if (line) outputAppendLine(outEl, "LOG: " + line);
+  });
+});
