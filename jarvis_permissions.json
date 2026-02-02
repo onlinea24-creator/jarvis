@@ -1,0 +1,15 @@
+{
+    "cmd_exec":  true,
+    "download":  true,
+    "fs_scan":  true,
+    "fs_organize":  true,
+    "fs_dedupe":  true,
+    "fs_quarantine":  true,
+    "fs_delete":  false,
+    "web_search":  true,
+    "web_fetch":  true,
+    "web_read":  true,
+    "tauri_plan":  true,
+    "ssot_write":  true,
+    "audit_write":  true
+}
